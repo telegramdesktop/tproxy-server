@@ -11,8 +11,9 @@ Group=mtproxy
 EnvironmentFile=/etc/mtproxy/mtproxy.env
 Environment=MTPROXY_WORKERS=1
 Environment=MTPROXY_MAX_CONNECTIONS=4096
+Environment=MTPROXY_NAT_INFO=
 WorkingDirectory=/opt/MTProxy
-ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS}
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS} $MTPROXY_NAT_INFO
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576

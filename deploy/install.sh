@@ -9,9 +9,10 @@ site_dir=
 site_upstream=
 mtproxy_workers=1
 mtproxy_max_connections=4096
+public_ip=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--public-ip A.B.C.D]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
 		--site-upstream) site_upstream="${2:-}"; shift 2 ;;
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
+		--public-ip) public_ip="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
 	esac
 done
@@ -57,6 +59,10 @@ if [[ ! "$mtproxy_workers" =~ ^[1-9][0-9]*$ ]] || ((mtproxy_workers > 256)); the
 fi
 if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
 	echo "mtproxy max connections must be positive" >&2
+	exit 2
+fi
+if [[ -n "$public_ip" ]] && [[ ! "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+	echo "public ip must be a dotted-quad IPv4 address" >&2
 	exit 2
 fi
 
@@ -187,10 +193,41 @@ backend_secret="$secret"
 if [[ "$backend_secret" == dd* ]] && [[ ${#backend_secret} -eq 34 ]]; then
 	backend_secret="${backend_secret:2}"
 fi
+# Official MTProxy announces the address of its own outgoing interface in the
+# RPC handshake with each Telegram middle-end. On a cloud instance whose public
+# address is NAT-ed onto a private interface address, that announcement does not
+# match the source address Telegram observes and every middle-end closes the
+# connection immediately after the handshake. MTProxy reconnects without any
+# backoff, which exhausts the host conntrack table within a minute and breaks
+# every stream the relay hands to it. --nat-info states both addresses.
+mtproxy_nat_info=
+# Ask the kernel which local address reaches a real Telegram middle-end rather
+# than a generic public address: on a host where another interface owns the
+# default route, only the route MTProxy itself takes identifies the address it
+# announces.
+nat_probe="$(sed -n 's/^proxy_for[[:space:]]\+-\?[0-9]\+[[:space:]]\+\([0-9.]\+\):[0-9]\+;.*/\1/p' \
+	/etc/mtproxy/proxy-multi.conf 2>/dev/null | head -1)"
+local_ip="$(ip -4 route get "${nat_probe:-149.154.175.50}" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+if [[ "$local_ip" =~ ^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
+	if [[ -z "$public_ip" ]]; then
+		# The hostname's A record is by definition this server's public address:
+		# Caddy could not have been asked for a certificate for it otherwise.
+		public_ip="$(getent ahostsv4 "$hostname" | awk '{print $1; exit}')"
+	fi
+	if [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [[ "$public_ip" != "$local_ip" ]]; then
+		mtproxy_nat_info="--nat-info $local_ip:$public_ip"
+		echo "MTProxy NAT mapping: $local_ip -> $public_ip"
+	else
+		echo "warning: interface address $local_ip is private but no public address was" >&2
+		echo "resolved for $hostname; pass --public-ip if MTProxy cannot reach Telegram" >&2
+	fi
+fi
+
 cat > /etc/mtproxy/mtproxy.env <<EOF
 MTPROXY_SECRET=$backend_secret
 MTPROXY_WORKERS=$mtproxy_workers
 MTPROXY_MAX_CONNECTIONS=$mtproxy_max_connections
+MTPROXY_NAT_INFO=$mtproxy_nat_info
 EOF
 chown root:mtproxy /etc/mtproxy/mtproxy.env
 chmod 0640 /etc/mtproxy/mtproxy.env

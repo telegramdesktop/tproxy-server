@@ -104,6 +104,21 @@ func TestPublicSourceValidation(t *testing.T) {
 	}
 }
 
+func TestPublicListenerMayUseUnspecifiedAddress(t *testing.T) {
+	value := Defaults()
+	value.PublicHostname = "proxy.example.com"
+	value.PublicUpstream = "http://127.0.0.1:3000"
+	value.ProfilesFile = "profiles.json"
+	value.Listen = "0.0.0.0:8080"
+	if err := value.validate(); err != nil {
+		t.Fatalf("container public listener was rejected: %v", err)
+	}
+	value.AdminListen = "0.0.0.0:8081"
+	if err := value.validate(); err == nil {
+		t.Fatal("public admin listener was accepted")
+	}
+}
+
 func TestPlainSecretMayBeginWithEE(t *testing.T) {
 	secret, err := DecodeSecret("ee0102030405060708090a0b0c0d0e0f")
 	if err != nil || len(secret) != 16 || secret[0] != 0xee {

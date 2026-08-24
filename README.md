@@ -600,3 +600,72 @@ when overriding the defaults.
 
 The complete architecture and implementation milestones remain in `PLAN.md`; the
 normative wire format is in `PROTOCOL.md`.
+
+## Docker Compose with Cloudflare Tunnel
+
+The Compose stack publishes no host ports. The relay listens on port 8080 only
+inside the private `tunnel` network, and `cloudflared` is the only HTTP ingress.
+Cloudflared also joins a separate outbound network so it can reach Cloudflare;
+the relay itself has no direct Internet egress.
+The admin listener remains on loopback inside the relay container and is not
+reachable from the tunnel container.
+
+Before the first start, copy `.env.example` to `.env`, set the token issued on the
+Cloudflare Zero Trust tunnel page, and set the same public hostname in
+`TPROXY_HOSTNAME` and `public_hostname` inside `docker/config.json`. Replace the
+example secret in `docker/profiles.json` with the same 16-byte hexadecimal
+MTProxy secret used by the client:
+
+```bash
+cp .env.example .env
+docker compose config
+docker compose build
+docker compose run --rm tproxy-server -config /etc/tproxy-server/config.json -check
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 tproxy-server
+docker compose logs --tail=100 cloudflared
+```
+
+In the Cloudflare tunnel configuration, create a Public Hostname whose service is
+`http://tproxy-server:8080`. Cloudflare terminates public HTTPS; Caddy is not part
+of this stack. Do not add a Compose `ports` mapping for the relay.
+
+### Настройка
+
+Создайте `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Заполните его:
+
+```dotenv
+TPROXY_HOSTNAME=proxy.example.com
+CLOUDFLARE_TUNNEL_TOKEN=токен_выданный_cloudflare
+```
+
+Такой же домен укажите в [`docker/config.json`](docker/config.json):
+
+```json
+"public_hostname": "proxy.example.com"
+```
+
+В Cloudflare для Public Hostname укажите сервис:
+
+```text
+http://tproxy-server:8080
+```
+
+Запуск:
+
+```bash
+docker compose down --remove-orphans
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cloudflared
+docker compose logs --tail=100 tproxy-server
+```
+
+Порты 80, 443 и 8080 на целевом хосте открывать или публиковать не требуется.

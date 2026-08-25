@@ -631,34 +631,34 @@ In the Cloudflare tunnel configuration, create a Public Hostname whose service i
 `http://tproxy-server:8080`. Cloudflare terminates public HTTPS; Caddy is not part
 of this stack. Do not add a Compose `ports` mapping for the relay.
 
-### Настройка
+### Setup
 
-Создайте `.env`:
+Create `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Заполните его:
+Configure it:
 
 ```dotenv
 TPROXY_HOSTNAME=proxy.example.com
-CLOUDFLARE_TUNNEL_TOKEN=токен_выданный_cloudflare
+CLOUDFLARE_TUNNEL_TOKEN=token-issued-by-cloudflare
 ```
 
-Такой же домен укажите в [`docker/config.json`](docker/config.json):
+Set the same hostname in [`docker/config.json`](docker/config.json):
 
 ```json
 "public_hostname": "proxy.example.com"
 ```
 
-В Cloudflare для Public Hostname укажите сервис:
+Configure this service URL for the Public Hostname in Cloudflare:
 
 ```text
 http://tproxy-server:8080
 ```
 
-Запуск:
+Start the stack:
 
 ```bash
 docker compose down --remove-orphans
@@ -668,4 +668,4 @@ docker compose logs --tail=100 cloudflared
 docker compose logs --tail=100 tproxy-server
 ```
 
-Порты 80, 443 и 8080 на целевом хосте открывать или публиковать не требуется.
+Ports 80, 443, and 8080 do not need to be opened or published on the target host.

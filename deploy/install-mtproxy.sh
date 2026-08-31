@@ -48,6 +48,17 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	rm -rf "$temporary"
 fi
 
+# make runs under the installer's umask, and deploy/install.sh sets 0077, so
+# objs/, objs/bin/ and the binary end up mode 0700, and the chown above leaves
+# them root:root. mtproxy.service runs as User=mtproxy, which can neither
+# traverse those directories nor execute the binary: systemd reports
+# status=203/EXEC and the relay stays at /readyz 503. Grant the runtime group
+# exactly what it needs, reusing the root:mtproxy 0750 scheme this installer
+# already applies to /etc/mtproxy. This runs on every invocation, not only
+# after a rebuild, so re-running the installer repairs an affected host.
+chown root:mtproxy "$source_directory/objs" "$source_directory/objs/bin" "$source_directory/objs/bin/mtproto-proxy"
+chmod 0750 "$source_directory/objs" "$source_directory/objs/bin" "$source_directory/objs/bin/mtproto-proxy"
+
 install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"
 config_temp="$(mktemp /etc/mtproxy/proxy-multi.conf.XXXXXX)"

@@ -22,6 +22,7 @@
 	# `encode` wraps every response identically.
 	encode zstd gzip
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	header -Via
 	reverse_proxy 127.0.0.1:8080 {
 		transport http {
 			response_header_timeout 40s

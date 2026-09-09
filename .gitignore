@@ -6,3 +6,4 @@
 /*.test
 /*.prof
 .DS_Store
+/.env

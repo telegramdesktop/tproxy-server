@@ -1,0 +1,10 @@
+{
+  "profiles": [
+    {
+      "name": "default",
+      "secret": "0123456789abcdef0123456789abcdef",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    }
+  ]
+}

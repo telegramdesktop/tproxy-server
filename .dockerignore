@@ -1,0 +1,13 @@
+.git
+.gitignore
+Dockerfile
+compose.yml
+README.md
+*.md
+config.json
+profiles.json
+websites
+coverage.out
+*.test
+*.prof
+.DS_Store

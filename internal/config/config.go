@@ -281,10 +281,10 @@ func (c Config) validate() error {
 	if c.PublicHostname != strings.ToLower(c.PublicHostname) {
 		return errors.New("public_hostname must already be lowercase ASCII/IDNA")
 	}
-	if err := validateLoopbackAddress(c.Listen); err != nil {
+	if err := validateListenAddress(c.Listen, true); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	if err := validateLoopbackAddress(c.AdminListen); err != nil {
+	if err := validateListenAddress(c.AdminListen, false); err != nil {
 		return fmt.Errorf("admin_listen: %w", err)
 	}
 	if c.Listen == c.AdminListen {
@@ -416,12 +416,19 @@ func DecodeSecret(value string) ([]byte, error) {
 }
 
 func validateLoopbackAddress(address string) error {
+	return validateListenAddress(address, false)
+}
+
+func validateListenAddress(address string, allowUnspecified bool) error {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
+	if ip == nil || (!ip.IsLoopback() && !(allowUnspecified && ip.IsUnspecified())) {
+		if allowUnspecified {
+			return errors.New("must use a numeric loopback or unspecified address")
+		}
 		return errors.New("must use a numeric loopback address")
 	}
 	value, err := strconv.Atoi(port)
@@ -456,7 +463,9 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 	extraPermissions := info.Mode().Perm() & 0077
 	credentialReadOnly := isSystemdCredential(path) &&
 		extraPermissions&0033 == 0
-	if extraPermissions != 0 && !credentialReadOnly {
+	dockerSecretReadOnly := filepath.Clean(filepath.Dir(path)) == "/run/secrets" &&
+		info.Mode().Perm()&0022 == 0
+	if extraPermissions != 0 && !credentialReadOnly && !dockerSecretReadOnly {
 		return nil, errors.New("profiles_file must not be readable or writable by group or others")
 	}
 	input, err := os.ReadFile(path)

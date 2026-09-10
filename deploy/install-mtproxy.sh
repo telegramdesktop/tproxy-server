@@ -47,6 +47,10 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	trap - EXIT
 	rm -rf "$temporary"
 fi
+# The build inherits the caller's umask, so the tree can end up root-only.
+# mtproxy.service runs as the unprivileged mtproxy user and must be able to
+# traverse the directories and execute the built binary.
+chmod -R a+rX "$source_directory"
 
 install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"

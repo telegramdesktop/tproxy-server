@@ -234,6 +234,12 @@ func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
 	if err := os.WriteFile(profiles, []byte(content), 0444); err != nil {
 		t.Fatal(err)
 	}
+	// Force the intended mode: install.sh runs tests under umask 077,
+	// which would otherwise strip the group/other read bits and make the
+	// "outside a credential directory" assertion below vacuously pass.
+	if err := os.Chmod(profiles, 0444); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CREDENTIALS_DIRECTORY", credentials)
 	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"credentials/profiles.json"}`
 	path := filepath.Join(directory, "config.json")

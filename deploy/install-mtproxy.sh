@@ -48,6 +48,15 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	rm -rf "$temporary"
 fi
 
+# install.sh runs with umask 077, so make's output keeps owner-only
+# permissions; the unprivileged mtproxy service user must be able to
+# traverse the tree and execute the binary. Normalize permissions
+# unconditionally: when the guard above skipped a rebuild (a previous
+# failed run may already have left /opt/MTProxy with a root-owned
+# 0700 binary), the tree is reused as-is and still needs this fix.
+chown -R root:root "$source_directory"
+chmod -R a+rX "$source_directory"
+
 install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"
 config_temp="$(mktemp /etc/mtproxy/proxy-multi.conf.XXXXXX)"

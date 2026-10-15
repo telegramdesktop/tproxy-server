@@ -184,6 +184,17 @@ mode. The choice is embedded in the generated bridge page and fixed for the
 resulting relay session; clients do not need a new setting or protocol
 implementation.
 
+On the public TLS listener, `https` and `https-lanes` use ordinary HTTP request
+and response semantics (typically multiplexed over ALPN `h2` by Caddy) with no
+HTTP/1.1 `Upgrade: websocket` / `101 Switching Protocols` transition. By
+contrast, `websocket` and `websocket-lanes` perform an RFC 6455 upgrade and
+maintain long-lived bidirectional WebSocket connections, which stateful DPI
+middleboxes (including TSPU) can classify and throttle after roughly 2 MiB of
+transfer. Deployments serving clients on such paths should select `https-lanes`
+or `https`. Because middleboxes treat `HTTP/1.1 101` differently from standard
+`POST`/`GET` requests, `carrier_mode` is strictly a server-profile property and
+clients must never self-negotiate or override the profile's configured mode.
+
 Carrier requests normally have `Origin: https://H`, but the reference relay does
 not authenticate that header: native WebViews may omit it, while non-browser
 clients can spoof it. Authentication comes from the unguessable bootstrap or
@@ -418,6 +429,8 @@ type:u8 | stream_id:u24 | payload_length:u32 | payload
 | `0x04` | `WINDOW` | both | nonzero | nonzero `u32` delta |
 | `0x05` | `PING` | relay → client | zero | opaque echo token |
 | `0x06` | `PONG` | client → relay | zero | exact echo token |
+| `0x07` | `OPEN_TCP` | client → relay | nonzero | `addr_len:u8 (4\|16) \| ip \| port:u16` |
+| `0x08` | `PAD` | both | zero | `0..255` opaque padding bytes |
 | `0x10` | `HELLO` | client → relay | zero | byte `01` |
 | `0x11` | `WELCOME` | relay → client | zero | empty |
 | `0x1f` | `BYE` | relay → client | zero | optional bounded reason |
@@ -476,6 +489,43 @@ well-formed late DATA, WINDOW, or CLOSE frames from a close race can be ignored.
 If an otherwise valid `OPEN` exceeds a per-session, profile, process-wide,
 dial-in-flight, or stream-creation-rate limit, the relay returns `CLOSE` for that
 stream id. It does not close the authenticated session or its other streams.
+
+### Opt-in TCP reflector streams for calls (`OPEN_TCP`)
+
+When a profile sets `"calls_tcp": true` on `https-lanes`, `websocket-lanes`, or
+`https-stream`, `POST /api/v1/session` includes `X-Call-TCP: 1` in its `200 OK`
+response and permits a nonzero stream or lane to open with `OPEN_TCP` (`0x07`)
+instead of `OPEN` (`0x01`). Its payload is a 7-byte IPv4 (`0x04 | ip[4] | port:u16`)
+or 19-byte IPv6 (`0x10 | ip[16] | port:u16`) numeric endpoint with a nonzero port;
+DNS names are never accepted.
+
+Before checking the profile's `call_allowlist` CIDRs and `call_ports`, the relay
+calls `Addr.Unmap()` and unconditionally rejects unspecified, loopback, private
+RFC 1918 / RFC 4193, link-local, and multicast destinations, preventing SSRF to
+loopback services (`127.0.0.1:2398`, `127.0.0.1:8080`, `127.0.0.1:8081`) or
+private networks even if an operator misconfigures `call_allowlist`. A target that
+is not permitted by `call_allowlist` and `call_ports` (or that fails to dial)
+receives `CLOSE` on that stream id without terminating the parent relay session.
+Receiving `OPEN_TCP` when `calls_tcp` is false or on `https`/`websocket` is a
+protocol error.
+
+On mobile clients where the WebView is foreground-scoped (`ANDROID.md`, `IOS.md`),
+a native VoIP call sidecar can fetch `GET /?bridge=<capability>` directly over
+HTTPS to obtain its own independent `bootstrap` token and `POST /api/v1/session`
+bearer (`X-Session-Token`). This Dual-Session Native Call Sidecar pattern keeps
+`X-Up-Seq`, `X-Down-Cursor`, and `stream_id` namespaces isolated from the
+foreground WebView so active calls survive proximity-sensor screen-off and app
+backgrounding.
+
+When call padding is enabled (`call_pad_buckets`, default `[256, 384, 512, 768]`,
+and `call_flush_jitter_ms`, default `8`), `POST /api/v1/session` also returns
+`X-Call-Pad-Buckets` and `X-Call-Flush-Jitter-Ms`. Both the bridge and the relay
+pad carrier writes for active call lanes/streams to a randomized bucket boundary
+by appending one or more `PAD` (`0x08`, `stream_id = 0`, payload `0..255` bytes)
+frames and applying a bounded `0..call_flush_jitter_ms` flush delay. If a remainder
+is `1..7` bytes (`< HeaderSize`), the target steps up by `128` bytes so a valid
+8-byte-header `PAD` frame always fits without overflow. Receiving sides strip
+`PAD` frames before lane-ID checks, window accounting, and native client delivery.
 
 ## Implementation references
 

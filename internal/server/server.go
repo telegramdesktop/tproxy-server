@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -277,6 +278,19 @@ func (s *Server) serveSession(
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
 	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
+	if profile := result.Session.Profile(); profile != nil && profile.CallsTCP && result.Session.CarrierMode().SupportsCallsTCP() {
+		w.Header().Set("X-Call-TCP", "1")
+		if len(profile.CallPadBuckets) > 0 {
+			parts := make([]string, len(profile.CallPadBuckets))
+			for i, bucket := range profile.CallPadBuckets {
+				parts[i] = strconv.Itoa(bucket)
+			}
+			w.Header().Set("X-Call-Pad-Buckets", strings.Join(parts, ","))
+		}
+		if profile.CallFlushJitterMs > 0 {
+			w.Header().Set("X-Call-Flush-Jitter-Ms", strconv.Itoa(profile.CallFlushJitterMs))
+		}
+	}
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result.Welcome)))
 	w.WriteHeader(http.StatusOK)
@@ -360,6 +374,7 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	var body []byte
 	var next uint64
 	var laneClosed bool
+	var laneID uint32
 	switch value.CarrierMode() {
 	case config.CarrierHTTPS:
 		if r.Header.Get("X-Lane-ID") != "" {
@@ -373,9 +388,10 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 			s.serveNotFound(w, r)
 			return
 		}
+		laneID = uint32(lane)
 		body, next, laneClosed, err = value.PollLane(
 			r.Context(),
-			uint32(lane),
+			laneID,
 			cursor)
 	default:
 		s.serveNotFound(w, r)
@@ -402,6 +418,13 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	if len(body) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+	if laneID != 0 && value.IsCallLane(laneID) {
+		if profile := value.Profile(); profile != nil && profile.CallFlushJitterMs > 0 {
+			if !sleepCallFlushJitter(r.Context(), profile.CallFlushJitterMs) {
+				return
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -594,16 +617,26 @@ func (s *Server) writeWebSocket(
 			finished <- nil
 			return
 		}
-		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			finished <- err
-			return
-		}
 		if len(body) == 0 {
+			if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				finished <- err
+				return
+			}
 			if err := connection.WriteMessage(websocket.PingMessage, nil); err != nil {
 				finished <- err
 				return
 			}
 			continue
+		}
+		if cursor != 0 && ((lanes && value.IsCallLane(laneID)) || (!lanes && value.HasActiveCallStreams())) {
+			if !sleepCallFlushJitter(ctx, value.Profile().CallFlushJitterMs) {
+				finished <- ctx.Err()
+				return
+			}
+		}
+		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			finished <- err
+			return
 		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
 			finished <- err
@@ -772,4 +805,26 @@ func canonicalUint(value string) (uint64, bool) {
 	}
 	result, err := strconv.ParseUint(value, 10, 64)
 	return result, err == nil && strconv.FormatUint(result, 10) == value
+}
+
+func sleepCallFlushJitter(ctx context.Context, maxJitterMs int) bool {
+	if maxJitterMs <= 0 {
+		return true
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return true
+	}
+	delayMs := int(b[0]) % (maxJitterMs + 1)
+	if delayMs == 0 {
+		return true
+	}
+	timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

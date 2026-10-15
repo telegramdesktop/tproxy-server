@@ -214,6 +214,9 @@ $public_source
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
 EOF
+# Omitting carrier_mode selects "https". On TSPU/DPI-filtered networks where
+# RFC 6455 WebSocket upgrades (101 Switching Protocols) are throttled after
+# ~2 MiB, set "carrier_mode":"https-lanes" for per-stream HTTP/2 isolation.
 cat > /etc/tproxy-server/profiles.json <<EOF
 {"profiles":[{"name":"default","secret":"$secret","backend":"127.0.0.1:2398"}]}
 EOF

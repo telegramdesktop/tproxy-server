@@ -9,6 +9,8 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +49,7 @@ type sessionOptions struct {
 
 type streamState struct {
 	backend           *backendStream
+	isCall            bool
 	receiveWindow     uint32
 	sendCredit        uint64
 	pendingWriteBytes int
@@ -76,6 +79,7 @@ type downBatch struct {
 }
 
 type carrierLane struct {
+	isCall          bool
 	lastUpSequence  uint64
 	lastUpDigest    [sha256.Size]byte
 	upActive        bool
@@ -109,6 +113,8 @@ type Session struct {
 
 	mu                    sync.Mutex
 	streams               map[uint32]*streamState
+	activeCallStreams     int
+	callDialMapper        func(netip.AddrPort) string
 	closedStreams         map[uint32]struct{}
 	closedOrder           []uint32
 	closedStart           int
@@ -179,6 +185,29 @@ func (s *Session) CarrierMode() config.CarrierMode {
 	return s.carrier
 }
 
+func (s *Session) Profile() *config.Profile {
+	return s.profile
+}
+
+func (s *Session) IsCallLane(laneID uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lane := s.carrierLanes[laneID]
+	return lane != nil && lane.isCall
+}
+
+func (s *Session) HasActiveCallStreams() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeCallStreams > 0
+}
+
+func (s *Session) SetCallDialMapperForTest(mapper func(netip.AddrPort) string) {
+	s.mu.Lock()
+	s.callDialMapper = mapper
+	s.mu.Unlock()
+}
+
 func (s *Session) AcquireWebSocket() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,6 +260,9 @@ func (s *Session) ReleaseWebSocketLane(laneID uint32) {
 	}
 	lane.websocketActive = false
 	if state := s.streams[laneID]; state != nil {
+		if state.isCall && s.activeCallStreams > 0 {
+			s.activeCallStreams--
+		}
 		s.releaseStreamWritesLocked(state)
 		delete(s.streams, laneID)
 		s.rememberClosedLocked(laneID)
@@ -285,6 +317,9 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 				break
 			}
 		}
+		if err == nil {
+			frames = frame.StripPadFrames(frames)
+		}
 	}
 
 	s.mu.Lock()
@@ -293,7 +328,21 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.mu.Unlock()
 		return 0, ErrClosed
 	}
-	if err != nil || !s.validateBatchLocked(frames) {
+	if err != nil {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, ErrProtocol
+	}
+	if len(frames) == 0 {
+		s.lastUpSequence = sequence
+		s.lastUpDigest = digest
+		s.mu.Unlock()
+		if s.onUp != nil {
+			s.onUp(len(body))
+		}
+		return sequence, nil
+	}
+	if !s.validateBatchLocked(frames) {
 		s.mu.Unlock()
 		s.protocolFailure()
 		return 0, ErrProtocol
@@ -342,9 +391,18 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	frames, err := frame.ParseAll(body, s.limits.MaxFramePayload)
 	if err == nil {
 		for _, value := range frames {
-			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil || value.StreamID != laneID {
+			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil {
 				err = ErrProtocol
 				break
+			}
+		}
+		if err == nil {
+			frames = frame.StripPadFrames(frames)
+			for _, value := range frames {
+				if value.StreamID != laneID {
+					err = ErrProtocol
+					break
+				}
 			}
 		}
 	}
@@ -359,25 +417,33 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		return 0, ErrClosed
 	}
 	lane := s.carrierLanes[laneID]
+	createdLane := false
 	if lane == nil {
-		if laneID != 0 && len(frames) != 0 && frames[0].Type != frame.Open &&
-			s.onlyLateFrames(frames) {
-			// The lane's tombstone has already been evicted (or the client
-			// remembers a close the relay no longer does): well-formed late
-			// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
-			// same as for a remembered tombstone, instead of killing the
-			// session.
-			s.lastActivity = time.Now()
-			s.mu.Unlock()
-			return sequence, nil
+		if laneID != 0 {
+			if len(frames) == 0 {
+				if _, wasClosed := s.closedStreams[laneID]; wasClosed || sequence > 1 {
+					s.lastActivity = time.Now()
+					s.mu.Unlock()
+					return sequence, nil
+				}
+			} else if !isOpenFrame(frames[0].Type) && s.onlyLateFrames(frames) {
+				// The lane's tombstone has already been evicted (or the client
+				// remembers a close the relay no longer does): well-formed late
+				// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
+				// same as for a remembered tombstone, instead of killing the
+				// session.
+				s.lastActivity = time.Now()
+				s.mu.Unlock()
+				return sequence, nil
+			}
 		}
-		if laneID == 0 || len(frames) == 0 || frames[0].Type != frame.Open {
+		if laneID == 0 || len(frames) == 0 || !isOpenFrame(frames[0].Type) {
 			s.mu.Unlock()
 			s.laneProtocolFailure(laneID)
 			return 0, ErrProtocol
 		}
 		lane = newCarrierLane()
-		s.carrierLanes[laneID] = lane
+		createdLane = true
 	}
 	s.lastActivity = time.Now()
 	if sequence == lane.lastUpSequence && sequence != 0 {
@@ -398,6 +464,20 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		s.mu.Unlock()
 		return 0, ErrConcurrent
 	}
+	if len(frames) == 0 {
+		if laneID != 0 && lane.lastUpSequence == 0 {
+			s.mu.Unlock()
+			s.laneProtocolFailure(laneID)
+			return 0, ErrProtocol
+		}
+		lane.lastUpSequence = sequence
+		lane.lastUpDigest = digest
+		s.mu.Unlock()
+		if s.onUp != nil {
+			s.onUp(len(body))
+		}
+		return sequence, nil
+	}
 	lane.upActive = true
 	if !s.validateBatchLocked(frames) {
 		lane.upActive = false
@@ -411,6 +491,12 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		lane.upActive = false
 		s.mu.Unlock()
 		return 0, ErrBackpressure
+	}
+	if createdLane {
+		lane.isCall = frames[0].Type == frame.OpenTCP
+		s.carrierLanes[laneID] = lane
+	} else if !lane.isCall && lane.lastUpSequence == 0 && len(frames) != 0 && frames[0].Type == frame.OpenTCP {
+		lane.isCall = true
 	}
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
 		frames,
@@ -706,6 +792,10 @@ func (s *Session) wait() {
 	s.backendWG.Wait()
 }
 
+func isOpenFrame(t frame.Type) bool {
+	return t == frame.Open || t == frame.OpenTCP
+}
+
 func (s *Session) onlyLateFrames(values []frame.Frame) bool {
 	for _, value := range values {
 		switch value.Type {
@@ -740,6 +830,14 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 		switch value.Type {
 		case frame.Open:
 			if exists || wasClosed {
+				return false
+			}
+			live[value.StreamID] = streamSnapshot{
+				receiveWindow: frame.InitialStreamWindow,
+				sendCredit:    frame.InitialStreamWindow,
+			}
+		case frame.OpenTCP:
+			if !s.profile.CallsTCP || !s.carrier.SupportsCallsTCP() || exists || wasClosed {
 				return false
 			}
 			live[value.StreamID] = streamSnapshot{
@@ -797,7 +895,7 @@ func (s *Session) backendWriteReservationLocked(
 			continue
 		}
 		switch value.Type {
-		case frame.Open:
+		case frame.Open, frame.OpenTCP:
 			live[value.StreamID] = true
 		case frame.Data:
 			if live[value.StreamID] {
@@ -829,7 +927,28 @@ func (s *Session) applyBatchLocked(
 		state := s.streams[value.StreamID]
 		_, wasClosed := s.closedStreams[value.StreamID]
 		switch value.Type {
-		case frame.Open:
+		case frame.Open, frame.OpenTCP:
+			address := s.profile.Backend
+			isCall := value.Type == frame.OpenTCP
+			if isCall {
+				target, err := frame.DecodeOpenTCPTarget(value.Payload)
+				if err != nil || !s.profile.AllowsCallTarget(target) {
+					s.rememberClosedLocked(value.StreamID)
+					if s.onStreamRejected != nil {
+						s.onStreamRejected()
+					}
+					if !s.queueFrameLocked(frame.Close, value.StreamID, nil) {
+						return opened, closed, reservedCost, reservedItems, false
+					}
+					continue
+				}
+				canonical := netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+				if s.callDialMapper != nil {
+					address = s.callDialMapper(canonical)
+				} else {
+					address = net.JoinHostPort(canonical.Addr().String(), strconv.Itoa(int(canonical.Port())))
+				}
+			}
 			if len(s.streams) >= s.limits.MaxStreamsPerSession ||
 				(s.acquireStream != nil && !s.acquireStream()) {
 				s.rememberClosedLocked(value.StreamID)
@@ -841,18 +960,22 @@ func (s *Session) applyBatchLocked(
 				}
 				continue
 			}
-			backend := newBackendStream(s, value.StreamID, s.profile.Backend)
+			backend := newBackendStream(s, value.StreamID, address)
 			state = &streamState{
 				backend:       backend,
+				isCall:        isCall,
 				receiveWindow: frame.InitialStreamWindow,
 				sendCredit:    frame.InitialStreamWindow,
 				creditNotify:  make(chan struct{}, 1),
 				writeNotify:   make(chan struct{}, 1),
 			}
+			if isCall {
+				s.activeCallStreams++
+			}
 			s.streams[value.StreamID] = state
 			opened = append(opened, backend)
 		case frame.Data:
-			if wasClosed {
+			if wasClosed || state == nil {
 				continue
 			}
 			cost, items := s.appendBackendWriteLocked(state, value.Payload)
@@ -861,7 +984,7 @@ func (s *Session) applyBatchLocked(
 			state.receiveWindow -= uint32(len(value.Payload))
 			signal(state.writeNotify)
 		case frame.Window:
-			if wasClosed {
+			if wasClosed || state == nil {
 				continue
 			}
 			amount, _ := frame.WindowAmount(value.Payload)
@@ -871,8 +994,11 @@ func (s *Session) applyBatchLocked(
 			}
 			signal(state.creditNotify)
 		case frame.Close:
-			if wasClosed {
+			if wasClosed || state == nil {
 				continue
+			}
+			if state.isCall && s.activeCallStreams > 0 {
+				s.activeCallStreams--
 			}
 			s.releaseStreamWritesLocked(state)
 			delete(s.streams, value.StreamID)
@@ -1021,6 +1147,9 @@ func (s *Session) backendClosed(id uint32, backend *backendStream) {
 	s.mu.Lock()
 	state := s.streams[id]
 	if !s.closed && state != nil && state.backend == backend {
+		if state.isCall && s.activeCallStreams > 0 {
+			s.activeCallStreams--
+		}
 		s.releaseStreamWritesLocked(state)
 		delete(s.streams, id)
 		s.rememberClosedLocked(id)
@@ -1293,6 +1422,9 @@ func (s *Session) takeDownBatchLocked() downBatch {
 	if len(s.pendingFrames) == 0 {
 		s.pendingFrames = nil
 	}
+	if s.activeCallStreams > 0 && len(s.profile.CallPadBuckets) > 0 && len(result) > 0 {
+		result = frame.AppendCallPadding(result, s.limits.CarrierBatchBytes, s.profile.CallPadBuckets)
+	}
 	return downBatch{body: result, cost: cost, items: count}
 }
 
@@ -1324,6 +1456,9 @@ func (s *Session) takeLaneDownBatchLocked(lane *carrierLane) downBatch {
 	}
 	if len(lane.pendingFrames) == 0 {
 		lane.pendingFrames = nil
+	}
+	if lane.isCall && len(s.profile.CallPadBuckets) > 0 && len(result) > 0 {
+		result = frame.AppendCallPadding(result, s.limits.CarrierBatchBytes, s.profile.CallPadBuckets)
 	}
 	return downBatch{body: result, cost: cost, items: count}
 }
@@ -1430,6 +1565,7 @@ func (s *Session) closeLocked() {
 		value.backend.close()
 	}
 	s.streams = nil
+	s.activeCallStreams = 0
 	if s.pendingCost != 0 || s.pendingItems != 0 {
 		if s.budget != nil {
 			s.budget(-s.pendingCost, -s.pendingItems, pendingUplink)

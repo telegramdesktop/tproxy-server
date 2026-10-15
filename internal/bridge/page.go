@@ -91,7 +91,7 @@ let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTime
 const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
 const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__;
-let upSequence=1,downCursor='0',upRunning=false;
+let upSequence=1,downCursor='0',upRunning=false,callPadBuckets=[],callFlushJitterMs=0;
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 const options=(method,token,body,headers,signal,keepalive)=>({
@@ -120,11 +120,55 @@ function splitFrames(value){
   if(value.byteLength-offset<8||result.length>=4096)throw new Error('invalid frame batch');
   const type=view.getUint8(offset),id=(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3);
   const size=view.getUint32(offset+4),end=offset+8+size;
-  if((type===2&&!size)||size>1048576||end>value.byteLength)throw new Error('invalid frame');
+  if((type===2&&!size)||(type===8&&(id!==0||size>255))||size>1048576||end>value.byteLength)throw new Error('invalid frame');
   result.push({type,id,data:offset===0&&end===value.byteLength?value:value.slice(offset,end)});offset=end;
  }
  if(!result.length)throw new Error('empty frame batch');
  return result;
+}
+function stripPadFrames(value){
+ const all=splitFrames(value);
+ if(!all.some(item=>item.type===8))return {frames:all,body:value};
+ const frames=all.filter(item=>item.type!==8);
+ let total=0;for(const item of frames)total+=item.data.byteLength;
+ const joined=new Uint8Array(total);let offset=0;
+ for(const item of frames){joined.set(new Uint8Array(item.data),offset);offset+=item.data.byteLength}
+ return {frames,body:joined.buffer};
+}
+function computePadPayloadsJS(rawLen,target){
+ let need=rawLen<target?target-rawLen:(rawLen%128?128-(rawLen%128):128);
+ if(need<8)need+=128;
+ const payloads=[];
+ while(need>0){
+  if(need<=263){payloads.push(need-8);break}
+  let chunk=263;if(need-chunk<8)chunk=need-8;
+  payloads.push(chunk-8);need-=chunk;
+ }
+ return payloads;
+}
+function padCallBatch(body,frameCount){
+ const rawLen=body.byteLength;
+ if(!rawLen||!callPadBuckets.length||frameCount<=0||frameCount>=4096)return body;
+ const minTarget=rawLen+8,eligible=callPadBuckets.filter(b=>b>=minTarget);
+ let target;
+ if(eligible.length>=2)target=eligible[Math.floor(Math.random()*2)];
+ else if(eligible.length===1)target=callPadBuckets.length>1?eligible[0]+(Math.random()<0.5?0:128):eligible[0];
+ else{const base=Math.ceil(minTarget/128)*128;target=callPadBuckets.length>1?base+(Math.random()<0.5?0:128):base}
+ let payloads=computePadPayloadsJS(rawLen,target);
+ if(!payloads.length||frameCount+payloads.length>4096)return body;
+ let added=0;for(const p of payloads)added+=8+p;
+ if(rawLen+added>batchLimit){
+  const minBase=Math.ceil(minTarget/128)*128;
+  if(minBase<target&&minBase<=batchLimit){
+   payloads=computePadPayloadsJS(rawLen,minBase);
+   added=0;for(const p of payloads)added+=8+p;
+  }
+  if(!payloads.length||frameCount+payloads.length>4096||rawLen+added>batchLimit)return body;
+ }
+ const out=new Uint8Array(rawLen+added),view=new DataView(out.buffer);
+ out.set(new Uint8Array(body),0);let offset=rawLen;
+ for(const p of payloads){out[offset]=8;view.setUint32(offset+4,p);offset+=8+p}
+ return out.buffer;
 }
 function frameBound(value,maxFrames,maxBytes){
  const view=new DataView(value);let offset=0,frames=0;
@@ -151,14 +195,14 @@ function joinPending(values,lane){
    const head=new Uint8Array(values[0],0,bound.bytes).slice();
    values[0]=values[0].slice(bound.bytes);
    queuedItems++;if(lane)lane.items++;
-   return {body:head.buffer,total:bound.bytes,count:1};
+   return {body:head.buffer,total:bound.bytes,count:1,frames:bound.frames};
   }
   if(count!==0&&(total+values[count].byteLength>batchLimit||frames+bound.frames>4096))break;
   total+=values[count].byteLength;frames+=bound.frames;count++;
  }
  const joined=new Uint8Array(total);let offset=0;
  for(const data of values.splice(0,count)){joined.set(new Uint8Array(data),offset);offset+=data.byteLength}
- return {body:joined.buffer,total,count};
+ return {body:joined.buffer,total,count,frames};
 }
 function retryAfterMs(response){
  const header=response.headers.get('Retry-After');
@@ -205,6 +249,10 @@ async function createSession(first){
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
   downCursor=response.headers.get('X-Down-Cursor')||'0';
+  const rawBuckets=response.headers.get('X-Call-Pad-Buckets')||'';
+  callPadBuckets=rawBuckets?rawBuckets.split(',').map(v=>Number(v)).filter(v=>Number.isInteger(v)&&v>=64&&v<=1024&&(v===64||v%128===0)).sort((a,b)=>a-b).slice(0,8):[];
+  const rawJitter=Number(response.headers.get('X-Call-Flush-Jitter-Ms')||'0');
+  callFlushJitterMs=Number.isInteger(rawJitter)&&rawJitter>0&&rawJitter<=15?rawJitter:0;
   if(!sessionToken)throw new Error('missing session token');
   if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();
@@ -251,14 +299,15 @@ async function poll(){
    if(response.status!==200)throw new Error('downlink rejected');
    const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer();
    if(!next||!data.byteLength)throw new Error('invalid downlink response');
+   const stripped=stripPadFrames(data);
    if(closed)return;
-   port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);downCursor=next;status('connected');
+   port.postMessage({t:'traffic',up:0,down:data.byteLength});if(stripped.body.byteLength)port.postMessage(stripped.body,[stripped.body]);downCursor=next;status('connected');
   }catch(error){if(!closed)fail();return}
  }
 }
 function ensureLane(id){
  let lane=lanes.get(id);
- if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane)}
+ if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false,isCall:false,jitterReady:false};lanes.set(id,lane)}
  return lane;
 }
 function rememberLaneClosed(id){
@@ -267,11 +316,12 @@ function rememberLaneClosed(id){
  closedLanes.add(id);closedLaneOrder.push(id);
 }
 function queueLane(value){
+ if(!value.id&&value.type!==6)throw new Error('invalid control lane frame');
  let lane=lanes.get(value.id);
  if(!lane&&(value.type===2||value.type===3||value.type===4))return;
  if(!lane&&closedLanes.has(value.id))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
+ if(!lane&&value.type!==1&&value.type!==7)throw new Error('lane did not begin with OPEN');
+ if(!lane){lane=ensureLane(value.id);lane.isCall=value.type===7}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);runLaneUp(lane);
 }
@@ -280,10 +330,15 @@ async function runLaneUp(lane){
  lane.running=true;
  try{
   while(!closed&&sessionToken&&lane.pending.length){
+   if(lane.isCall&&callFlushJitterMs>0){
+    await pause(Math.floor(Math.random()*(callFlushJitterMs+1)));
+    if(closed||!sessionToken||!lane.pending.length)break;
+   }
    const batch=joinPending(lane.pending,lane),sequence=String(lane.sequence),laneID=String(lane.id);
-   const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
+   const wireBody=lane.isCall&&callPadBuckets.length?padCallBatch(batch.body,batch.frames):batch.body;
+   const response=await request('api/v1/up',()=>options('POST',sessionToken,wireBody,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
-   release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
+   release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:wireBody.byteLength,down:0});lane.sequence++;
    if(!lane.polling)pollLane(lane);
   }
  }catch(error){fail()}
@@ -304,9 +359,10 @@ async function pollLane(lane){
    if(response.status!==200)throw new Error('lane downlink rejected');
    const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer();
    if(!next||!data.byteLength)throw new Error('invalid lane downlink response');
-   for(const value of splitFrames(data))if(value.id!==lane.id)throw new Error('cross-lane frame');
+   const stripped=stripPadFrames(data);
+   for(const value of stripped.frames)if(value.id!==lane.id)throw new Error('cross-lane frame');
    if(closed)return;
-   port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
+   port.postMessage({t:'traffic',up:0,down:data.byteLength});if(stripped.body.byteLength)port.postMessage(stripped.body,[stripped.body]);lane.cursor=next;status('connected');
   }
  }catch(error){if(!closed)fail()}
  finally{lane.polling=false;lane.controller=null}
@@ -318,7 +374,8 @@ function openWebSocket(){
   socket.onopen=()=>resolve();
   socket.onmessage=event=>{
    if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+   let stripped;try{stripped=stripPadFrames(event.data)}catch(error){fail();return}
+   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});if(stripped.body.byteLength)port.postMessage(stripped.body,[stripped.body]);status('connected');
   };
   socket.onerror=()=>reject(new Error('websocket failed'));
   socket.onclose=()=>{if(!closed)fail()};
@@ -360,10 +417,10 @@ function openWebSocketLane(lane){
  socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
  socket.onmessage=event=>{
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-  let values;try{values=splitFrames(event.data)}catch(error){fail();return}
-  if(values.some(value=>value.id!==lane.id)){fail();return}
-  if(values.some(value=>value.type===3))lane.remoteClosed=true;
-  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  let stripped;try{stripped=stripPadFrames(event.data)}catch(error){fail();return}
+  if(stripped.frames.some(value=>value.id!==lane.id)){fail();return}
+  if(stripped.frames.some(value=>value.type===3))lane.remoteClosed=true;
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});if(stripped.body.byteLength)port.postMessage(stripped.body,[stripped.body]);status('connected');
  };
  socket.onerror=()=>{};
  socket.onclose=()=>{
@@ -376,8 +433,8 @@ function queueWebSocketLane(value){
  let lane=lanes.get(value.id);
  if(!lane&&(value.type===2||value.type===3||value.type===4))return;
  if(!value.id||(!lane&&closedLanes.has(value.id)))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
+ if(!lane&&value.type!==1&&value.type!==7)throw new Error('lane did not begin with OPEN');
+ if(!lane){lane=ensureLane(value.id);lane.isCall=value.type===7}
  if(value.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);if(value.type===3)lane.localClosed=true;
@@ -390,9 +447,16 @@ function runWebSocketLaneUp(lane){
   if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;runWebSocketLaneUp(lane)},10);
   return;
  }
+ if(lane.isCall&&callFlushJitterMs>0&&!lane.jitterReady){
+  if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;lane.jitterReady=true;runWebSocketLaneUp(lane)},Math.floor(Math.random()*(callFlushJitterMs+1)));
+  return;
+ }
+ lane.jitterReady=false;
  try{
-  const batch=joinPending(lane.pending,lane);socket.send(batch.body);release(batch.total,batch.count,lane);
-  port.postMessage({t:'traffic',up:batch.total,down:0});
+  const batch=joinPending(lane.pending,lane);
+  const wireBody=lane.isCall&&callPadBuckets.length?padCallBatch(batch.body,batch.frames):batch.body;
+  socket.send(wireBody);release(batch.total,batch.count,lane);
+  port.postMessage({t:'traffic',up:wireBody.byteLength,down:0});
   if(lane.pending.length)queueMicrotask(()=>runWebSocketLaneUp(lane));
  }catch(error){fail()}
 }

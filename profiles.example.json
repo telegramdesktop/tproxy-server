@@ -4,7 +4,7 @@
       "name": "default",
       "secret": "000102030405060708090a0b0c0d0e0f",
       "backend": "127.0.0.1:2398",
-      "carrier_mode": "https"
+      "carrier_mode": "https-lanes"
     }
   ]
 }

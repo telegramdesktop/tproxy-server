@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -282,3 +285,182 @@ func TestDefaultReconnectGraceIsShort(t *testing.T) {
 		t.Fatal("reconnect_grace default is not 2m")
 	}
 }
+
+func TestExampleConfigsValidate(t *testing.T) {
+	directory := t.TempDir()
+
+	profilesBytes, err := os.ReadFile(filepath.Join("..", "..", "profiles.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	if err := os.WriteFile(profilesPath, profilesBytes, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(profilesPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenKeyPath := filepath.Join(directory, "token.key")
+	if err := os.WriteFile(tokenKeyPath, bytes.Repeat([]byte{0x42}, 32), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tokenKeyPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	configBytes, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(configBytes, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["profiles_file"] = profilesPath
+	raw["token_key_file"] = tokenKeyPath
+	modifiedConfig, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(configPath, modifiedConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("failed to load example config and profiles: %v", err)
+	}
+	if len(loaded.Profiles) < 1 || loaded.Profiles[0].CarrierMode != CarrierHTTPSLanes {
+		t.Fatalf("expected default profile in profiles.example.json to use https-lanes, got: %#v", loaded.Profiles)
+	}
+}
+
+func TestCallsTCPDefaultsValidationAndSSRFGuard(t *testing.T) {
+	directory := t.TempDir()
+	public := filepath.Join(directory, "public")
+	if err := os.Mkdir(public, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(public, "index.html"), []byte("site"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	writeProfiles := func(extra string) {
+		_ = os.Remove(profilesPath)
+		value := `{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398"` + extra + `}]}`
+		if err := os.WriteFile(profilesPath, []byte(value), 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(directory, "config.json")
+	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"profiles.json"}`
+	if err := os.WriteFile(configPath, []byte(server), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default Telegram AS CIDRs and ports [443, 5222] when calls_tcp: true on https-lanes.
+	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true`)
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("valid calls_tcp profile failed to load: %v", err)
+	}
+	profile := loaded.Profiles[0]
+	if !profile.CallsTCP || len(profile.CallAllowlist) != len(DefaultTelegramCallPrefixes()) || len(profile.CallPorts) != 2 {
+		t.Fatalf("unexpected default call profile: %#v", profile)
+	}
+	if len(profile.CallPadBuckets) != 4 || profile.CallPadBuckets[0] != 256 || profile.CallPadBuckets[3] != 768 || profile.CallFlushJitterMs != DefaultCallFlushJitterMs {
+		t.Fatalf("unexpected default call padding config: buckets=%v jitter=%d", profile.CallPadBuckets, profile.CallFlushJitterMs)
+	}
+	for _, allowed := range []string{
+		"149.154.167.99:443",
+		"91.108.16.42:5222",
+		"[2001:67c:4e8:f002::a]:443",
+		"[::ffff:149.154.167.99]:443",
+	} {
+		if !profile.AllowsCallTarget(netip.MustParseAddrPort(allowed)) {
+			t.Fatalf("expected target %s to be allowed", allowed)
+		}
+	}
+	for _, forbidden := range []string{
+		"127.0.0.1:443",
+		"127.0.0.1:2398",
+		"[::1]:443",
+		"[::7f00:1]:443",
+		"[::ffff:0:127.0.0.1]:443",
+		"[::ffff:127.0.0.1]:443",
+		"[::ffff:10.0.0.1]:443",
+		"10.0.0.1:443",
+		"192.168.1.1:443",
+		"169.254.169.254:443",
+		"100.64.0.1:443",
+		"149.154.167.99:80",
+		"8.8.8.8:443",
+	} {
+		if profile.AllowsCallTarget(netip.MustParseAddrPort(forbidden)) {
+			t.Fatalf("expected target %s to be rejected", forbidden)
+		}
+	}
+	if !IsForbiddenCallAddr(netip.MustParseAddr("2001:67c:4e8:f002::a").WithZone("lo0")) {
+		t.Fatal("expected zoned IPv6 address to be rejected by IsForbiddenCallAddr")
+	}
+
+	// Custom call_pad_quantum shorthand and explicit disable.
+	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_quantum":256,"call_flush_jitter_ms":0`)
+	loadedQuantum, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("valid call_pad_quantum failed to load: %v", err)
+	}
+	if len(loadedQuantum.Profiles[0].CallPadBuckets) != 2 ||
+		loadedQuantum.Profiles[0].CallPadBuckets[0] != 256 ||
+		loadedQuantum.Profiles[0].CallPadBuckets[1] != 512 ||
+		loadedQuantum.Profiles[0].CallFlushJitterMs != 0 {
+		t.Fatalf("unexpected call_pad_quantum expansion: %#v", loadedQuantum.Profiles[0])
+	}
+
+	writeProfiles(`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[0]`)
+	loadedDisabled, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("explicitly disabled call_pad_buckets failed to load: %v", err)
+	}
+	if len(loadedDisabled.Profiles[0].CallPadBuckets) != 0 {
+		t.Fatalf("expected disabled CallPadBuckets, got %v", loadedDisabled.Profiles[0].CallPadBuckets)
+	}
+
+	// Reject calls_tcp on non-lane carriers (https and websocket).
+	for _, badCarrier := range []string{`"https"`, `"websocket"`} {
+		writeProfiles(`,"carrier_mode":` + badCarrier + `,"calls_tcp":true`)
+		if _, err := Load(configPath); err == nil {
+			t.Fatalf("accepted calls_tcp on carrier %s", badCarrier)
+		}
+	}
+
+	// Reject forbidden, non-canonical, or wildcard CIDRs, port 0, and invalid call padding configs.
+	for _, badExtra := range []string{
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["0.0.0.0/0"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["::/0"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["127.0.0.0/8"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["126.0.0.0/7"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["10.0.0.0/8"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["100.64.0.0/10"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["::ffff:149.154.160.0/116"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_allowlist":["149.154.167.99/20"]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_ports":[0]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":false,"call_ports":[443]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[256,512],"call_pad_quantum":256`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[100,256]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[512,256]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_pad_buckets":[2048]`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_flush_jitter_ms":16`,
+		`,"carrier_mode":"https-lanes","calls_tcp":true,"call_flush_jitter_ms":-1`,
+		`,"carrier_mode":"https-lanes","calls_tcp":false,"call_pad_buckets":[256]`,
+	} {
+		writeProfiles(badExtra)
+		if _, err := Load(configPath); err == nil {
+			t.Fatalf("accepted invalid call config %s", badExtra)
+		}
+	}
+}
+
+

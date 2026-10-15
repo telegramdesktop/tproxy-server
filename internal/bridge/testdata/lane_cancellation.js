@@ -13,7 +13,7 @@ function frame(type,id,payload=new Uint8Array()){
  return data.buffer;
 }
 const fetch=async()=>({status:200,headers:{get(name){
- return name==='X-Carrier-Mode'?'websocket-lanes':name==='X-Session-Token'?'session':'';
+ return name==='X-Carrier-Mode'?'websocket-lanes':name==='X-Session-Token'?'session':name==='X-Call-Pad-Buckets'?'256,384,512,768':'';
 }},arrayBuffer:async()=>frame(17,0)});
 class WebSocket{
  static CONNECTING=0;static OPEN=1;static CLOSED=3;
@@ -54,6 +54,7 @@ vm.runInContext(`
  const live=sockets.at(-1);live.open();
  assert.equal(live.sent.length,1,'live lane must flush its queued frames');
  assert.equal(new Uint8Array(live.sent[0])[0],1);
+ assert.equal(live.sent[0].byteLength,17,'non-call lane must not be padded');
  send(3,9002);
  assert.equal(live.readyState,WebSocket.OPEN,'established lane must send its protocol CLOSE');
  assert.equal(new Uint8Array(live.sent.at(-1))[0],3);
@@ -62,6 +63,27 @@ vm.runInContext(`
  send(2,9002,payload);send(3,9002);send(4,9002,new Uint8Array(4));
  assert.equal(sockets.length,count,'late frames must not reopen a finished lane');
  healthy();
+
+ // OpenTCP (type 7) must open a call lane, pad uplink writes to a bucket,
+ // and strip downlink Pad (type 8, stream 0) frames before native postMessage.
+ send(7,9003,new Uint8Array([4,149,154,164,10,1,187]));
+ send(2,9003,new Uint8Array([99]));
+ const callLane=sockets.at(-1);callLane.open();
+ assert.equal(callLane.sent.length,1,'OpenTCP lane must flush its queued frames');
+ assert.equal(new Uint8Array(callLane.sent[0])[0],7);
+ assert(callLane.sent[0].byteLength===256||callLane.sent[0].byteLength===384,'call lane uplink must be padded to a bucket');
+ const downData=new Uint8Array(frame(2,9003,new Uint8Array([55]))),downPad=new Uint8Array(frame(8,0,new Uint8Array(32)));
+ const downBatch=new Uint8Array(downData.length+downPad.length);
+ downBatch.set(downData,0);downBatch.set(downPad,downData.length);
+ const beforeMessages=messages.length;
+ callLane.onmessage({data:downBatch.buffer});
+ healthy();
+ const binaryDeliveries=messages.slice(beforeMessages).filter(v=>v instanceof ArrayBuffer);
+ assert.equal(binaryDeliveries.length,1,'only the DATA frame must reach the native boundary');
+ assert.equal(new Uint8Array(binaryDeliveries[0])[0],2,'Pad frame must be stripped before native delivery');
+ callLane.close();
+ healthy();
+
  TelegramWebProxy.onmessage({data:{t:'close'}});
 })()
 `,context).catch(error=>{console.error(error);process.exitCode=1});

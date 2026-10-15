@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -282,3 +284,55 @@ func TestDefaultReconnectGraceIsShort(t *testing.T) {
 		t.Fatal("reconnect_grace default is not 2m")
 	}
 }
+
+func TestExampleConfigsValidate(t *testing.T) {
+	directory := t.TempDir()
+
+	profilesBytes, err := os.ReadFile(filepath.Join("..", "..", "profiles.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	if err := os.WriteFile(profilesPath, profilesBytes, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(profilesPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenKeyPath := filepath.Join(directory, "token.key")
+	if err := os.WriteFile(tokenKeyPath, bytes.Repeat([]byte{0x42}, 32), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tokenKeyPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	configBytes, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(configBytes, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["profiles_file"] = profilesPath
+	raw["token_key_file"] = tokenKeyPath
+	modifiedConfig, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(configPath, modifiedConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("failed to load example config and profiles: %v", err)
+	}
+	if len(loaded.Profiles) < 1 || loaded.Profiles[0].CarrierMode != CarrierHTTPSLanes {
+		t.Fatalf("expected default profile in profiles.example.json to use https-lanes, got: %#v", loaded.Profiles)
+	}
+}
+

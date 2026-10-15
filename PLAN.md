@@ -69,9 +69,11 @@ deployable server with several future products. This revision fixes the followin
    query value. WebView inputs contain that derived value rather than the MTProxy
    secret.
 3. Profiles can select the baseline serialized HTTPS carrier, stream-aware HTTPS
-   lanes, one multiplexed WebSocket, or one WebSocket per logical stream.
-   Streaming fetch, H3, Telegram Web integration, calls, and cross-process session
-   resume remain deferred.
+   lanes, one multiplexed WebSocket, or one WebSocket per logical stream;
+   deployments on DPI-filtered or TSPU paths should prefer `https-lanes` (or
+   `https`) to avoid HTTP `101` WebSocket upgrade fingerprinting. Streaming
+   fetch, H3, Telegram Web integration, calls, and cross-process session resume
+   remain deferred.
 4. Caddy terminates TLS and serves the public site. The Go process is an internal
    application server.
 5. The official MTProxy `-H` and `-p` arguments are ports, not bind addresses.
@@ -338,8 +340,11 @@ Bridge behavior:
    session-close request. Server idle cleanup remains the fallback.
 
 The reference modes and their exact authentication, sequencing, replay, and close
-semantics are specified normatively in `PROTOCOL.md`. The remainder of this section
-describes the original serialized HTTPS baseline.
+semantics are specified normatively in `PROTOCOL.md`. When deployed across
+stateful middleboxes that fingerprint and throttle RFC 6455 `101 Switching
+Protocols` upgrades after a few megabytes (such as TSPU), profiles should prefer
+`https-lanes` or `https` over `websocket` and `websocket-lanes`. The remainder
+of this section describes the original serialized HTTPS baseline.
 
 ## 6. Baseline HTTP carrier protocol
 
@@ -966,7 +971,8 @@ Hosted acceptance:
 - a separate production `/bridge` route or API access without session credentials;
 - running official MTProxy as a separate public service;
 - use of the raw MTProxy secret by bridge JavaScript;
-- WebSocket, streaming fetch, HTTP/3, WebTransport, or CDN fronting;
+- streaming fetch, HTTP/3, WebTransport, or CDN fronting (WebSocket carriers are
+  implemented; see `README.md` for carrier selection on DPI-filtered networks);
 - Telegram Web A/K integration;
 - calls or UDP relay;
 - client-selected backend destinations;

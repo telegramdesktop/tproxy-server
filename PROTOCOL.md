@@ -184,6 +184,17 @@ mode. The choice is embedded in the generated bridge page and fixed for the
 resulting relay session; clients do not need a new setting or protocol
 implementation.
 
+On the public TLS listener, `https` and `https-lanes` use ordinary HTTP request
+and response semantics (typically multiplexed over ALPN `h2` by Caddy) with no
+HTTP/1.1 `Upgrade: websocket` / `101 Switching Protocols` transition. By
+contrast, `websocket` and `websocket-lanes` perform an RFC 6455 upgrade and
+maintain long-lived bidirectional WebSocket connections, which stateful DPI
+middleboxes (including TSPU) can classify and throttle after roughly 2 MiB of
+transfer. Deployments serving clients on such paths should select `https-lanes`
+or `https`. Because middleboxes treat `HTTP/1.1 101` differently from standard
+`POST`/`GET` requests, `carrier_mode` is strictly a server-profile property and
+clients must never self-negotiate or override the profile's configured mode.
+
 Carrier requests normally have `Origin: https://H`, but the reference relay does
 not authenticate that header: native WebViews may omit it, while non-browser
 clients can spoof it. Authentication comes from the unguessable bootstrap or

@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -1097,5 +1099,260 @@ func TestEvictedLaneReleasesBudgetAndIgnoresLateFrames(t *testing.T) {
 	value.mu.Unlock()
 	if closed {
 		t.Fatal("late DATA for an evicted lane closed the session")
+	}
+}
+
+func TestOpenTCPAllowedReflectorEcho(t *testing.T) {
+	reflector, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reflector.Close()
+	go func() {
+		for {
+			conn, acceptErr := reflector.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	for _, mode := range []config.CarrierMode{config.CarrierHTTPSLanes, config.CarrierWebSocketLanes} {
+		configuration := testConfig("127.0.0.1:1")
+		configuration.Profiles[0].CarrierMode = mode
+		configuration.Profiles[0].CallsTCP = true
+		configuration.Profiles[0].CallAllowlist = config.DefaultTelegramCallPrefixes()
+		configuration.Profiles[0].CallPorts = config.DefaultTelegramCallPorts()
+		manager := NewManager(configuration, [32]byte{1})
+		defer manager.Shutdown()
+
+		bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := manager.Create(bootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := created.Session
+		value.SetCallDialMapperForTest(func(target netip.AddrPort) string {
+			if target == netip.MustParseAddrPort("149.154.167.99:443") {
+				return reflector.Addr().String()
+			}
+			return target.String()
+		})
+
+		targetPayload, err := frame.EncodeOpenTCPPayload(netip.MustParseAddrPort("149.154.167.99:443"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		laneID := uint32(101)
+		peerTagAndMedia := []byte("0123456789abcdef-call-frame-payload")
+		batch := append(frame.Encode(frame.OpenTCP, laneID, targetPayload), frame.Encode(frame.Data, laneID, peerTagAndMedia)...)
+		if mode == config.CarrierWebSocketLanes {
+			if !value.AcquireWebSocketLane(laneID) {
+				t.Fatal("AcquireWebSocketLane failed")
+			}
+			defer value.ReleaseWebSocketLane(laneID)
+		}
+		if ack, upErr := value.ProcessUpLane(laneID, 1, batch); upErr != nil || ack != 1 {
+			t.Fatalf("OpenTCP lane failed on %s: ack=%d err=%v", mode, ack, upErr)
+		}
+		if !value.IsCallLane(laneID) || !value.HasActiveCallStreams() {
+			t.Fatalf("expected lane and session to be marked as active call on %s", mode)
+		}
+
+		var echoed []byte
+		cursor := uint64(0)
+		deadline := time.Now().Add(2 * time.Second)
+		for len(echoed) < len(peerTagAndMedia) && time.Now().Before(deadline) {
+			down, next, laneClosed, pollErr := value.PollLane(context.Background(), laneID, cursor)
+			if pollErr != nil || laneClosed {
+				t.Fatalf("PollLane failed on %s: closed=%v err=%v", mode, laneClosed, pollErr)
+			}
+			cursor = next
+			frames, parseErr := frame.ParseAll(down, frame.MaxPayload)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			for _, item := range frames {
+				if item.Type == frame.Data && item.StreamID == laneID {
+					echoed = append(echoed, item.Payload...)
+				}
+			}
+		}
+		if !bytes.Equal(echoed, peerTagAndMedia) {
+			t.Fatalf("echoed call payload on %s: %q != %q", mode, echoed, peerTagAndMedia)
+		}
+	}
+}
+
+func TestOpenTCPDisallowedTargetClosesStreamNotSession(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			conn, acceptErr := backend.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	configuration := testConfig(backend.Addr().String())
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	configuration.Profiles[0].CallsTCP = true
+	configuration.Profiles[0].CallAllowlist = config.DefaultTelegramCallPrefixes()
+	configuration.Profiles[0].CallPorts = config.DefaultTelegramCallPorts()
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := created.Session
+
+	// Open a normal MTProto stream on lane 1 and verify it survives disallowed OpenTCP attempts on other lanes.
+	if ack, upErr := value.ProcessUpLane(1, 1, frame.Encode(frame.Open, 1, nil)); upErr != nil || ack != 1 {
+		t.Fatalf("failed to open normal stream 1: ack=%d err=%v", ack, upErr)
+	}
+
+	for idx, rawTarget := range []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:2398"),
+		netip.MustParseAddrPort("[::ffff:127.0.0.1]:443"),
+		netip.MustParseAddrPort("198.51.100.7:443"),
+		netip.MustParseAddrPort("149.154.167.99:80"),
+	} {
+		laneID := uint32(200 + idx)
+		var payload []byte
+		if rawTarget.Addr().Is4In6() {
+			raw16 := rawTarget.Addr().As16()
+			payload = make([]byte, 19)
+			payload[0] = 16
+			copy(payload[1:17], raw16[:])
+			payload[17] = byte(rawTarget.Port() >> 8)
+			payload[18] = byte(rawTarget.Port())
+		} else {
+			payload, err = frame.EncodeOpenTCPPayload(rawTarget)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Include trailing DATA in the same batch to verify reserved write budget is refunded cleanly.
+		batch := append(frame.Encode(frame.OpenTCP, laneID, payload), frame.Encode(frame.Data, laneID, []byte("ignored"))...)
+		if ack, upErr := value.ProcessUpLane(laneID, 1, batch); upErr != nil || ack != 1 {
+			t.Fatalf("disallowed OpenTCP target %v killed session instead of closing stream: ack=%d err=%v", rawTarget, ack, upErr)
+		}
+		down, next, laneClosed, pollErr := value.PollLane(context.Background(), laneID, 0)
+		if pollErr != nil || laneClosed || next != 1 {
+			t.Fatalf("expected CLOSE batch on lane %d: next=%d closed=%v err=%v", laneID, next, laneClosed, pollErr)
+		}
+		frames, parseErr := frame.ParseAll(down, frame.MaxPayload)
+		if parseErr != nil || len(frames) != 1 || frames[0].Type != frame.Close || frames[0].StreamID != laneID {
+			t.Fatalf("expected single CLOSE frame on lane %d, got %#v (%v)", laneID, frames, parseErr)
+		}
+		// Acknowledge final cursor so lane unacked budget is released.
+		_, _, laneClosed, pollErr = value.PollLane(context.Background(), laneID, next)
+		if pollErr != nil || !laneClosed {
+			t.Fatalf("expected lane %d to report closed after cursor ack: closed=%v err=%v", laneID, laneClosed, pollErr)
+		}
+	}
+
+	// Verify normal stream 1 still transfers data after disallowed OpenTCP streams.
+	msg := []byte("still-alive")
+	if ack, upErr := value.ProcessUpLane(1, 2, frame.Encode(frame.Data, 1, msg)); upErr != nil || ack != 2 {
+		t.Fatalf("normal stream 1 uplink failed after disallowed OpenTCP: ack=%d err=%v", ack, upErr)
+	}
+	var got []byte
+	cursor := uint64(0)
+	for len(got) < len(msg) {
+		down, next, laneClosed, pollErr := value.PollLane(context.Background(), 1, cursor)
+		if pollErr != nil || laneClosed {
+			t.Fatalf("normal stream 1 PollLane failed: closed=%v err=%v", laneClosed, pollErr)
+		}
+		cursor = next
+		frames, parseErr := frame.ParseAll(down, frame.MaxPayload)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		for _, item := range frames {
+			if item.Type == frame.Data && item.StreamID == 1 {
+				got = append(got, item.Payload...)
+			}
+		}
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("normal stream 1 echo %q != %q", got, msg)
+	}
+	if ack, upErr := value.ProcessUpLane(1, 3, frame.Encode(frame.Close, 1, nil)); upErr != nil || ack != 3 {
+		t.Fatalf("normal stream 1 close failed: ack=%d err=%v", ack, upErr)
+	}
+	_, _, _, _ = value.PollLane(context.Background(), 1, cursor)
+
+	value.mu.Lock()
+	pendingCost, pendingItems, sessionClosed := value.pendingCost, value.pendingItems, value.closed
+	value.mu.Unlock()
+	if sessionClosed || pendingCost != 0 || pendingItems != 0 {
+		t.Fatalf("session state after disallowed OpenTCP streams: closed=%v cost=%d items=%d", sessionClosed, pendingCost, pendingItems)
+	}
+}
+
+func TestOpenTCPRejectedWhenDisabledOrWrongCarrier(t *testing.T) {
+	payload, err := frame.EncodeOpenTCPPayload(netip.MustParseAddrPort("149.154.167.99:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1. Disabled on https-lanes -> protocol error.
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	configuration.Profiles[0].CallsTCP = false
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := created.Session.ProcessUpLane(1, 1, frame.Encode(frame.OpenTCP, 1, payload)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("accepted OpenTCP when calls_tcp is false: %v", err)
+	}
+
+	// 2. Wrong carrier (https) even if CallsTCP is set on the struct -> protocol error.
+	wrongCarrierCfg := testConfig("127.0.0.1:1")
+	wrongCarrierCfg.Profiles[0].CarrierMode = config.CarrierHTTPS
+	wrongCarrierCfg.Profiles[0].CallsTCP = true
+	wrongCarrierCfg.Profiles[0].CallAllowlist = config.DefaultTelegramCallPrefixes()
+	wrongCarrierCfg.Profiles[0].CallPorts = config.DefaultTelegramCallPorts()
+	wrongManager := NewManager(wrongCarrierCfg, [32]byte{2})
+	defer wrongManager.Shutdown()
+	wrongBootstrap, err := wrongManager.IssueBootstrap(&wrongCarrierCfg.Profiles[0], "198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCreated, err := wrongManager.Create(wrongBootstrap, "198.51.100.9", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrongCreated.Session.ProcessUp(1, frame.Encode(frame.OpenTCP, 1, payload)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("accepted OpenTCP on serialized CarrierHTTPS: %v", err)
 	}
 }

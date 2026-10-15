@@ -239,7 +239,11 @@ padded secret and accepts the link.
   type.
 - `ProxyServersStatuses.swift` does not ping inactive WEB rows. They display
   `Not tested`; only the active row follows the real account connection state.
-- Calls remain SOCKS5-only. A WEB entry must not be offered for calls.
+- Calls remain SOCKS5-only in the WKWebView-only POC. When a relay profile
+  advertises `X-Call-TCP: 1` (`"calls_tcp": true`), a native CallKit-scoped sidecar
+  can obtain an independent session token from `GET /?bridge=<capability>` and open
+  `OPEN_TCP` (`0x07`) streams directly so active calls survive screen-off and
+  backgrounding.
 - `ProxyServerPreviewScreen.swift` must not compare a WEB connection's reported
   loopback address with its saved public hostname. Its WEB preview omits the
   implicit HTTPS port and inactive status check; Connect waits for the account

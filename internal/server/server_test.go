@@ -784,6 +784,51 @@ func TestAdminSurfaceIsSeparate(t *testing.T) {
 	}
 }
 
+func TestCallsTCPHeaderAndDualSessionSidecar(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+		value.Profiles[0].CallsTCP = true
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
+	capability := config.CapabilityString(config.DeriveCapability(testHost, "", secret))
+	match := regexp.MustCompile(`bootstrap="([A-Za-z0-9_-]{43})"`)
+
+	issueSession := func() string {
+		bridgeResponse := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+url.QueryEscape(capability), nil, ""))
+		bridgeBody := readResponse(t, bridgeResponse)
+		found := match.FindSubmatch(bridgeBody)
+		if len(found) != 2 {
+			t.Fatal("could not locate embedded bootstrap token")
+		}
+		bootstrap := string(found[1])
+		created := perform(t, hosted.Client(), apiRequest(
+			t,
+			http.MethodPost,
+			hosted.URL+"/api/v1/session",
+			bootstrap,
+			frame.Encode(frame.Hello, 0, []byte{1})))
+		_ = readResponse(t, created)
+		if created.StatusCode != http.StatusOK {
+			t.Fatalf("session creation failed: status %d", created.StatusCode)
+		}
+		if created.Header.Get("X-Call-TCP") != "1" {
+			t.Fatalf("expected X-Call-TCP: 1 header, got %q", created.Header.Get("X-Call-TCP"))
+		}
+		return created.Header.Get("X-Session-Token")
+	}
+
+	webViewToken := issueSession()
+	callSidecarToken := issueSession()
+	if webViewToken == "" || callSidecarToken == "" || webViewToken == callSidecarToken {
+		t.Fatalf("expected two independent session tokens for dual-session sidecar, got %q and %q", webViewToken, callSidecarToken)
+	}
+}
+
 func newTestServer(t *testing.T, backend string) (*Server, []byte) {
 	return newConfiguredTestServer(t, backend, nil)
 }

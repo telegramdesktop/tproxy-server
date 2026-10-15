@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 )
 
 const (
@@ -24,6 +25,7 @@ const (
 	Window  Type = 0x04
 	Ping    Type = 0x05
 	Pong    Type = 0x06
+	OpenTCP Type = 0x07
 	Hello   Type = 0x10
 	Welcome Type = 0x11
 	Bye     Type = 0x1F
@@ -120,6 +122,59 @@ func WindowPayload(amount uint32) []byte {
 	return result
 }
 
+func EncodeOpenTCPPayload(target netip.AddrPort) ([]byte, error) {
+	if !target.IsValid() || target.Port() == 0 {
+		return nil, errors.New("OPEN_TCP target requires a valid IP address and nonzero port")
+	}
+	addr := target.Addr().Unmap()
+	if addr.Is4() {
+		raw := addr.As4()
+		result := make([]byte, 7)
+		result[0] = 4
+		copy(result[1:5], raw[:])
+		binary.BigEndian.PutUint16(result[5:7], target.Port())
+		return result, nil
+	}
+	raw := addr.As16()
+	result := make([]byte, 19)
+	result[0] = 16
+	copy(result[1:17], raw[:])
+	binary.BigEndian.PutUint16(result[17:19], target.Port())
+	return result, nil
+}
+
+func DecodeOpenTCPTarget(payload []byte) (netip.AddrPort, error) {
+	if len(payload) == 0 {
+		return netip.AddrPort{}, errors.New("OPEN_TCP payload must not be empty")
+	}
+	switch payload[0] {
+	case 4:
+		if len(payload) != 7 {
+			return netip.AddrPort{}, errors.New("OPEN_TCP IPv4 payload must be 7 bytes")
+		}
+		var raw [4]byte
+		copy(raw[:], payload[1:5])
+		port := binary.BigEndian.Uint16(payload[5:7])
+		if port == 0 {
+			return netip.AddrPort{}, errors.New("OPEN_TCP port must be nonzero")
+		}
+		return netip.AddrPortFrom(netip.AddrFrom4(raw), port), nil
+	case 16:
+		if len(payload) != 19 {
+			return netip.AddrPort{}, errors.New("OPEN_TCP IPv6 payload must be 19 bytes")
+		}
+		var raw [16]byte
+		copy(raw[:], payload[1:17])
+		port := binary.BigEndian.Uint16(payload[17:19])
+		if port == 0 {
+			return netip.AddrPort{}, errors.New("OPEN_TCP port must be nonzero")
+		}
+		return netip.AddrPortFrom(netip.AddrFrom16(raw), port), nil
+	default:
+		return netip.AddrPort{}, fmt.Errorf("OPEN_TCP address length %d is invalid", payload[0])
+	}
+}
+
 func ValidateClientShape(value Frame) error {
 	if value.StreamID == 0 {
 		if value.Type != Pong || len(value.Payload) > 64 {
@@ -131,6 +186,10 @@ func ValidateClientShape(value Frame) error {
 	case Open, Close:
 		if len(value.Payload) != 0 {
 			return fmt.Errorf("frame type %#x requires an empty payload", value.Type)
+		}
+	case OpenTCP:
+		if _, err := DecodeOpenTCPTarget(value.Payload); err != nil {
+			return err
 		}
 	case Data:
 		if len(value.Payload) == 0 {

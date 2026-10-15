@@ -62,6 +62,16 @@ vm.runInContext(`
  send(2,9002,payload);send(3,9002);send(4,9002,new Uint8Array(4));
  assert.equal(sockets.length,count,'late frames must not reopen a finished lane');
  healthy();
+
+ // OpenTCP (type 7) must also open a lane and flush its queued frames.
+ send(7,9003,new Uint8Array([4,149,154,164,10,1,187]));
+ send(2,9003,new Uint8Array([99]));
+ const callLane=sockets.at(-1);callLane.open();
+ assert.equal(callLane.sent.length,1,'OpenTCP lane must flush its queued frames');
+ assert.equal(new Uint8Array(callLane.sent[0])[0],7);
+ callLane.close();
+ healthy();
+
  TelegramWebProxy.onmessage({data:{t:'close'}});
 })()
 `,context).catch(error=>{console.error(error);process.exitCode=1});

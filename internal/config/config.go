@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -45,6 +46,11 @@ func (m CarrierMode) Valid() bool {
 	return m == CarrierHTTPS ||
 		m == CarrierHTTPSLanes ||
 		m == CarrierWebSocket ||
+		m == CarrierWebSocketLanes
+}
+
+func (m CarrierMode) SupportsCallsTCP() bool {
+	return m == CarrierHTTPSLanes ||
 		m == CarrierWebSocketLanes
 }
 
@@ -132,11 +138,14 @@ type profileFile struct {
 }
 
 type profileInput struct {
-	Name        string        `json:"name"`
-	Secret      string        `json:"secret"`
-	Backend     string        `json:"backend"`
-	CarrierMode CarrierMode   `json:"carrier_mode"`
-	Limits      ProfileLimits `json:"limits"`
+	Name          string        `json:"name"`
+	Secret        string        `json:"secret"`
+	Backend       string        `json:"backend"`
+	CarrierMode   CarrierMode   `json:"carrier_mode"`
+	CallsTCP      bool          `json:"calls_tcp"`
+	CallAllowlist []string      `json:"call_allowlist"`
+	CallPorts     []uint16      `json:"call_ports"`
+	Limits        ProfileLimits `json:"limits"`
 }
 
 type ProfileLimits struct {
@@ -152,11 +161,14 @@ type ProfileLimits struct {
 }
 
 type Profile struct {
-	Name        string
-	Backend     string
-	CarrierMode CarrierMode
-	Capability  [sha256.Size]byte
-	Limits      ProfileLimits
+	Name          string
+	Backend       string
+	CarrierMode   CarrierMode
+	CallsTCP      bool
+	CallAllowlist []netip.Prefix
+	CallPorts     []uint16
+	Capability    [sha256.Size]byte
+	Limits        ProfileLimits
 }
 
 func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
@@ -563,6 +575,17 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 		if !carrierMode.Valid() {
 			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, or websocket-lanes", input.Name)
 		}
+		if input.CallsTCP && !carrierMode.SupportsCallsTCP() {
+			return nil, fmt.Errorf("profile %q calls_tcp requires https-lanes or websocket-lanes carrier_mode", input.Name)
+		}
+		callAllowlist, err := resolveCallAllowlist(input.CallsTCP, input.CallAllowlist)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q call_allowlist: %w", input.Name, err)
+		}
+		callPorts, err := resolveCallPorts(input.CallsTCP, input.CallPorts)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q call_ports: %w", input.Name, err)
+		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
@@ -579,16 +602,203 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 			return nil, fmt.Errorf("duplicate capability for profile %q", input.Name)
 		}
 		result = append(result, Profile{
-			Name:        input.Name,
-			Backend:     input.Backend,
-			CarrierMode: carrierMode,
-			Capability:  capability,
-			Limits:      profileLimits,
+			Name:          input.Name,
+			Backend:       input.Backend,
+			CarrierMode:   carrierMode,
+			CallsTCP:      input.CallsTCP,
+			CallAllowlist: callAllowlist,
+			CallPorts:     callPorts,
+			Capability:    capability,
+			Limits:        profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}
 	}
 	return result, nil
+}
+
+var defaultTelegramCallCIDRs = []string{
+	"91.105.192.0/23",
+	"91.108.4.0/22",
+	"91.108.8.0/22",
+	"91.108.12.0/22",
+	"91.108.16.0/22",
+	"91.108.20.0/22",
+	"91.108.56.0/22",
+	"95.161.64.0/20",
+	"149.154.160.0/20",
+	"185.76.151.0/24",
+	"2001:67c:4e8::/48",
+	"2001:b28:f23c::/47",
+	"2001:b28:f23f::/48",
+	"2a0a:f280::/32",
+}
+
+var forbiddenCallPrefixes = func() []netip.Prefix {
+	cidrs := []string{
+		"0.0.0.0/8",
+		"10.0.0.0/8",
+		"100.64.0.0/10",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"172.16.0.0/12",
+		"192.0.0.0/24",
+		"192.0.2.0/24",
+		"192.88.99.0/24",
+		"192.168.0.0/16",
+		"198.18.0.0/15",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+		"224.0.0.0/4",
+		"240.0.0.0/4",
+		"::/128",
+		"::1/128",
+		"::ffff:0:0/96",
+		"64:ff9b::/96",
+		"64:ff9b:1::/48",
+		"100::/64",
+		"2001::/32",
+		"2001:2::/48",
+		"2001:db8::/32",
+		"2002::/16",
+		"fc00::/7",
+		"fe80::/10",
+		"fec0::/10",
+		"ff00::/8",
+	}
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		prefixes = append(prefixes, netip.MustParsePrefix(cidr))
+	}
+	return prefixes
+}()
+
+func DefaultTelegramCallPrefixes() []netip.Prefix {
+	result := make([]netip.Prefix, 0, len(defaultTelegramCallCIDRs))
+	for _, cidr := range defaultTelegramCallCIDRs {
+		result = append(result, netip.MustParsePrefix(cidr))
+	}
+	return result
+}
+
+func DefaultTelegramCallPorts() []uint16 {
+	return []uint16{443, 5222}
+}
+
+var globalUnicastIPv6Prefix = netip.MustParsePrefix("2000::/3")
+
+func IsForbiddenCallAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.Zone() != "" {
+		return true
+	}
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() ||
+		addr.IsPrivate() ||
+		addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified() {
+		return true
+	}
+	if addr.Is6() && !globalUnicastIPv6Prefix.Contains(addr) {
+		return true
+	}
+	for _, forbidden := range forbiddenCallPrefixes {
+		if forbidden.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveCallAllowlist(enabled bool, raw []string) ([]netip.Prefix, error) {
+	if !enabled {
+		if len(raw) != 0 {
+			return nil, errors.New("requires calls_tcp to be enabled")
+		}
+		return nil, nil
+	}
+	if len(raw) == 0 {
+		return DefaultTelegramCallPrefixes(), nil
+	}
+	result := make([]netip.Prefix, 0, len(raw))
+	for _, entry := range raw {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil || !prefix.IsValid() {
+			return nil, fmt.Errorf("invalid CIDR %q", entry)
+		}
+		if prefix.Addr().Is4In6() {
+			return nil, fmt.Errorf("IPv4-mapped IPv6 CIDR %q is not allowed", entry)
+		}
+		if prefix.Masked() != prefix {
+			return nil, fmt.Errorf("CIDR %q must be canonical (%s)", entry, prefix.Masked())
+		}
+		if prefix.Bits() <= 0 {
+			return nil, fmt.Errorf("wildcard CIDR %q is not allowed", entry)
+		}
+		if IsForbiddenCallAddr(prefix.Addr()) {
+			return nil, fmt.Errorf("CIDR %q lies in a reserved or non-public range", entry)
+		}
+		for _, forbidden := range forbiddenCallPrefixes {
+			if prefix.Overlaps(forbidden) {
+				return nil, fmt.Errorf("CIDR %q overlaps reserved range %s", entry, forbidden)
+			}
+		}
+		result = append(result, prefix)
+	}
+	return result, nil
+}
+
+func resolveCallPorts(enabled bool, raw []uint16) ([]uint16, error) {
+	if !enabled {
+		if len(raw) != 0 {
+			return nil, errors.New("requires calls_tcp to be enabled")
+		}
+		return nil, nil
+	}
+	if len(raw) == 0 {
+		return DefaultTelegramCallPorts(), nil
+	}
+	seen := make(map[uint16]struct{}, len(raw))
+	result := make([]uint16, 0, len(raw))
+	for _, port := range raw {
+		if port == 0 {
+			return nil, errors.New("port 0 is not allowed")
+		}
+		if _, exists := seen[port]; exists {
+			continue
+		}
+		seen[port] = struct{}{}
+		result = append(result, port)
+	}
+	return result, nil
+}
+
+func (p Profile) AllowsCallTarget(target netip.AddrPort) bool {
+	if !p.CallsTCP || !p.CarrierMode.WithDefault().SupportsCallsTCP() || !target.IsValid() || target.Port() == 0 {
+		return false
+	}
+	addr := target.Addr().Unmap()
+	if IsForbiddenCallAddr(addr) {
+		return false
+	}
+	portAllowed := false
+	for _, allowedPort := range p.CallPorts {
+		if allowedPort == target.Port() {
+			portAllowed = true
+			break
+		}
+	}
+	if !portAllowed {
+		return false
+	}
+	for _, prefix := range p.CallAllowlist {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateProfileLimits(value ProfileLimits, global Limits) error {

@@ -277,6 +277,9 @@ func (s *Server) serveSession(
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
 	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
+	if profile := result.Session.Profile(); profile != nil && profile.CallsTCP && result.Session.CarrierMode().SupportsCallsTCP() {
+		w.Header().Set("X-Call-TCP", "1")
+	}
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result.Welcome)))
 	w.WriteHeader(http.StatusOK)

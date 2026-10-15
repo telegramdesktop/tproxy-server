@@ -258,7 +258,7 @@ async function poll(){
 }
 function ensureLane(id){
  let lane=lanes.get(id);
- if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane)}
+ if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false,isCall:false};lanes.set(id,lane)}
  return lane;
 }
 function rememberLaneClosed(id){
@@ -267,11 +267,12 @@ function rememberLaneClosed(id){
  closedLanes.add(id);closedLaneOrder.push(id);
 }
 function queueLane(value){
+ if(!value.id&&value.type!==6)throw new Error('invalid control lane frame');
  let lane=lanes.get(value.id);
  if(!lane&&(value.type===2||value.type===3||value.type===4))return;
  if(!lane&&closedLanes.has(value.id))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
+ if(!lane&&value.type!==1&&value.type!==7)throw new Error('lane did not begin with OPEN');
+ if(!lane){lane=ensureLane(value.id);lane.isCall=value.type===7}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);runLaneUp(lane);
 }
@@ -376,8 +377,8 @@ function queueWebSocketLane(value){
  let lane=lanes.get(value.id);
  if(!lane&&(value.type===2||value.type===3||value.type===4))return;
  if(!value.id||(!lane&&closedLanes.has(value.id)))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
+ if(!lane&&value.type!==1&&value.type!==7)throw new Error('lane did not begin with OPEN');
+ lane=lane||ensureLane(value.id);if(value.type===7)lane.isCall=true;
  if(value.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);if(value.type===3)lane.localClosed=true;

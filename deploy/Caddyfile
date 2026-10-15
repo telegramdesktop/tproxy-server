@@ -3,12 +3,11 @@
 	admin off
 	servers {
 		protocols h1 h2
-		# read_body maps to Go's ReadTimeout; it must stay well above the
-		# relay's long_poll (25s) so parked polls are never cut, while still
-		# bounding a slow-body client at this hop too.
+		# tproxy-server enforces its own 30s bodyReadDeadline on standard
+		# requests and sliding per-envelope deadlines on /api/v1/stream, so
+		# Caddy only bounds header reads here without cutting active streams.
 		timeouts {
 			read_header 10s
-			read_body 60s
 		}
 	}
 }
@@ -26,6 +25,7 @@
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	}
 	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
 		transport http {
 			response_header_timeout 40s
 		}

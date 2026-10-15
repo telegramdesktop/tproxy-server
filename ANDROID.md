@@ -296,8 +296,12 @@ malformed frame, a queue overflow, and app background/foreground transitions.
   the real connection state is learned only after activation. Automatic or
   sequential list-page tests would churn the process-wide WebView carrier and are
   intentionally unsupported.
-- WEB entries are excluded from proxy rotation and calls. One process-wide WebView
-  carrier serves all Telegram accounts.
+- WEB entries are excluded from proxy rotation and calls in the WebView-only POC.
+  One process-wide WebView carrier serves all Telegram accounts. When a relay
+  profile advertises `X-Call-TCP: 1` (`"calls_tcp": true`), background-safe voice
+  calls can use a native Dual-Session Call Sidecar that fetches
+  `GET /?bridge=<capability>` directly to obtain an independent session token and
+  opens `OPEN_TCP` (`0x07`) streams without depending on the foreground WebView.
 - The historical capability context remains
   `tdesktop-web-proxy-bridge-v1` for wire compatibility. Renaming it would rotate
   every deployed capability and requires an explicit protocol version.

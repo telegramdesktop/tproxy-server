@@ -426,6 +426,7 @@ systemd units, and let the relay serve the whole hostname:
 encode zstd gzip
 header -Via
 reverse_proxy 127.0.0.1:8080 {
+  flush_interval -1
   transport http {
     response_header_timeout 40s
   }
@@ -512,10 +513,11 @@ client secret, and numeric loopback backend:
 
 | Mode | Carrier behavior | Primary tradeoff |
 |---|---|---|
-| `https` | one serialized POST plus one long poll | conservative baseline; one direction is capped near `carrier_batch_bytes / RTT` |
-| `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions and isolates latency; relies on HTTP/2 for many concurrent polls |
-| `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion and failure domain |
-| `websocket-lanes` | one ordered WebSocket for every logical stream | isolates browser and relay queues so bulk media does not block interactive streams; increases connection and handshake count |
+| `https` | one serialized POST plus one long poll | conservative baseline; avoids HTTP `101` WebSocket upgrades; one direction is capped near `carrier_batch_bytes / RTT` |
+| `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions, isolates latency over HTTP/2, and avoids HTTP `101` WebSocket upgrades; recommended on TSPU/DPI-filtered networks |
+| `https-stream` | one full-duplex streaming `POST /api/v1/stream` carrying length-delimited envelopes | eliminates per-batch HTTP stop-and-wait RTT without an HTTP `101` WebSocket upgrade; suited for native HTTP/2 call sidecars and Chromium-based WebViews (`duplex: 'half'`, not supported on iOS `WKWebView`) |
+| `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion domain; vulnerable to stateful DPI/TSPU throttling of HTTP `101` upgrades |
+| `websocket-lanes` | one ordered WebSocket for every logical stream | isolates browser and relay queues so bulk media does not block interactive streams; increases connection/handshake count and exposes HTTP `101` upgrades per stream |
 
 The mode is selected through the secret/profile, so existing Desktop, Android, and
 iOS proof-of-concept clients need no new setting or client-side transport code. Use
@@ -526,10 +528,31 @@ macOS WebKit can serialize WebSocket handshakes to the same host. With
 take longer to open than the client's connection timeout. The bridge cancels a
 pending handshake when the client closes that stream, but each remaining lane
 still needs its own handshake. If connection establishment is slow or media
-streams keep reconnecting, use `"carrier_mode": "websocket"` in the affected
+streams keep reconnecting on unrestricted networks, use `"carrier_mode": "websocket"` in the affected
 profile in `/etc/tproxy-server/profiles.json`, then run
 `sudo systemctl restart tproxy-server`. Clients reconnect using the new mode with
 the same hostname and secret; the public website configuration needs no change.
+
+On networks filtered by stateful middleboxes such as TSPU, do not use `websocket`
+or `websocket-lanes`. Field measurements on TSPU-filtered residential paths show
+that RFC 6455 WebSocket connections (`Upgrade: websocket` / `101 Switching Protocols`)
+are fingerprinted and throttled after roughly 2 MiB of transfer even inside TLS 1.3
+with normal SNI, whether a client opens one WebSocket or ten parallel lanes, while
+ordinary HTTPS request/response flows to the exact same origin transfer 180+ MiB
+without throttling. For profiles serving clients on TSPU-filtered paths, set
+`"carrier_mode": "https-lanes"` (or `"https"` as a conservative fallback) instead
+of switching between WebSocket modes.
+
+To allow Telegram voice/video call TCP reflectors (`phoneConnection` TCP endpoints)
+through a profile using `https-lanes`, `websocket-lanes`, or `https-stream`, set
+`"calls_tcp": true`. When `call_allowlist` and `call_ports` are omitted, the relay
+populates official Telegram ASN IPv4/IPv6 CIDR prefixes and ports `[443, 5222]`,
+while unconditionally blocking loopback, RFC 1918, RFC 4193, link-local, multicast,
+and unspecified addresses before checking the allowlist. Call profiles also enable
+multi-bucket `PAD` (`0x08`) traffic shaping (`call_pad_buckets`, default
+`[256, 384, 512, 768]`, or single-integer shorthand `call_pad_quantum`) and bounded
+flush micro-pacing (`call_flush_jitter_ms`, default `8`, range `0..15`) so 20 ms
+Opus voice packets do not form a constant-size 50 Hz DPI signature.
 
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend
@@ -712,6 +735,12 @@ when overriding the defaults.
   the relay, drive `127.0.0.1:2398` directly with a client that performs the
   obfuscated2 handshake and one `req_pq`: a healthy MTProxy returns `resPQ`
   within a few hundred milliseconds.
+- **Connections open and text messages work, but media downloads or uploads stall
+  after roughly 1–2 MiB:** stateful middleboxes (such as TSPU) fingerprint and
+  throttle upgraded RFC 6455 WebSocket connections after a few megabytes of
+  transfer. Check `/etc/tproxy-server/profiles.json`: if `carrier_mode` is set to
+  `websocket` or `websocket-lanes`, change it to `https-lanes` (or `https`) and
+  restart `tproxy-server`.
 - **The public site works but the bridge fails:** inspect only sanitized service
   status and metrics. Never log bridge URLs or authorization headers.
 - **Configuration check fails on permissions:** the profiles file must have no group

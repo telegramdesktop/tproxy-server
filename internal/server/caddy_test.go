@@ -31,6 +31,16 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
 
+func TestCaddyfileFlushIntervalDisabled(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/Caddyfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "flush_interval -1") {
+		t.Fatal("deploy/Caddyfile must set flush_interval -1 inside reverse_proxy for https-stream")
+	}
+}
+
 func TestCaddyPublicParityAndCarriers(t *testing.T) {
 	binary := os.Getenv("TPROXY_CADDY_BIN")
 	if binary == "" {
@@ -48,7 +58,7 @@ func TestCaddyPublicParityAndCarriers(t *testing.T) {
 		value.PublicUpstream = public.URL
 		original := value.Profiles[0]
 		value.Profiles = nil
-		for i, mode := range []config.CarrierMode{config.CarrierHTTPS, config.CarrierHTTPSLanes, config.CarrierWebSocket, config.CarrierWebSocketLanes} {
+		for i, mode := range []config.CarrierMode{config.CarrierHTTPS, config.CarrierHTTPSLanes, config.CarrierHTTPSStream, config.CarrierWebSocket, config.CarrierWebSocketLanes} {
 			profile := original
 			profile.Name = string(mode)
 			profile.CarrierMode = mode
@@ -135,6 +145,22 @@ func TestCaddyPublicParityAndCarriers(t *testing.T) {
 				if !found {
 					t.Fatal("carrier echo not received through Caddy")
 				}
+			} else if mode == config.CarrierHTTPSStream {
+				pr, pw := io.Pipe()
+				defer pw.Close()
+				resp := openStreamRequest(t, client, relay, token, pr)
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("https-stream status = %d", resp.StatusCode)
+				}
+				if _, err := pw.Write(frame.EncodeStreamUpEnvelope(1, 0, payload)); err != nil {
+					t.Fatal(err)
+				}
+				lastCursor := readStreamForData(t, resp.Body, pw, 17, []byte("Caddy echo"))
+				if _, err := pw.Write(frame.EncodeStreamUpEnvelope(0, lastCursor, nil)); err != nil {
+					t.Fatal(err)
+				}
+				_ = pw.Close()
 			} else {
 				protocol := webSocketProtocolPrefix + token
 				if mode == config.CarrierWebSocketLanes {
@@ -176,7 +202,7 @@ func TestCaddyPublicParityAndCarriers(t *testing.T) {
 	}
 	hosted.Close()
 	var reference []byte
-	for _, path := range []string{"/random", "/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/ws"} {
+	for _, path := range []string{"/random", "/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/stream", "/api/v1/ws"} {
 		response := perform(t, client, request(t, "GET", relay+path, nil, ""))
 		body := readResponse(t, response)
 		if response.StatusCode != http.StatusBadGateway || response.Header.Get("Content-Security-Policy") != "" || response.Header.Get("Cache-Control") != "no-store" {

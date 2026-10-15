@@ -21,6 +21,7 @@ P empty (today, unchanged):     P = t7k2xw:
   POST /api/v1/session            POST /t7k2xw/api/v1/session
   POST /api/v1/up                 POST /t7k2xw/api/v1/up
   POST /api/v1/down               POST /t7k2xw/api/v1/down
+  POST /api/v1/stream             POST /t7k2xw/api/v1/stream
   GET  /api/v1/ws                 GET  /t7k2xw/api/v1/ws
 ```
 
@@ -299,6 +300,7 @@ example.com {
 
 	handle /phcf2vfe7zgbrslg/* {
 		reverse_proxy 127.0.0.1:8080 {
+			flush_interval -1
 			transport http {
 				response_header_timeout 40s
 			}

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -145,14 +146,20 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if r.ContentLength != 0 {
+	suffix, hasSuffix := s.transportSuffix(r.URL.Path)
+	canonicalSuffix := hasSuffix && r.URL.EscapedPath() == r.URL.Path
+	isStreamPost := canonicalSuffix && suffix == "api/v1/stream" && r.Method == http.MethodPost
+	if r.ContentLength != 0 && !isStreamPost {
 		s.setReadDeadline(w)
 	}
 	if r.Host != s.config.PublicHostname && r.Host != s.config.PublicHostname+":443" {
+		if isStreamPost && r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
 		s.serveNotFound(w, r)
 		return
 	}
-	if suffix, ok := s.transportSuffix(r.URL.Path); ok && r.URL.EscapedPath() == r.URL.Path {
+	if canonicalSuffix {
 		s.serveAPI(w, r, suffix)
 		return
 	}
@@ -201,11 +208,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 		len(r.Header.Values("Authorization")) > 1 ||
 		len(r.Header.Values("Sec-WebSocket-Protocol")) > 1 ||
 		(r.Header.Get("Cookie") != "" && suffix != "api/v1/ws") {
+		if suffix == "api/v1/stream" && r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
 		s.serveNotFound(w, r)
 		return
 	}
 	clientIP, err := s.clientIP(r)
 	if err != nil {
+		if suffix == "api/v1/stream" && r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
 		s.serveNotFound(w, r)
 		return
 	}
@@ -215,6 +228,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
+		if suffix == "api/v1/stream" && r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
 		s.serveNotFound(w, r)
 		return
 	}
@@ -225,6 +241,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 		s.serveUp(w, r, token)
 	case "api/v1/down":
 		s.serveDown(w, r, token)
+	case "api/v1/stream":
+		s.serveStream(w, r, token)
 	default:
 		s.serveNotFound(w, r)
 	}
@@ -277,6 +295,19 @@ func (s *Server) serveSession(
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
 	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
+	if profile := result.Session.Profile(); profile != nil && profile.CallsTCP && result.Session.CarrierMode().SupportsCallsTCP() {
+		w.Header().Set("X-Call-TCP", "1")
+		if len(profile.CallPadBuckets) > 0 {
+			parts := make([]string, len(profile.CallPadBuckets))
+			for i, bucket := range profile.CallPadBuckets {
+				parts[i] = strconv.Itoa(bucket)
+			}
+			w.Header().Set("X-Call-Pad-Buckets", strings.Join(parts, ","))
+		}
+		if profile.CallFlushJitterMs > 0 {
+			w.Header().Set("X-Call-Flush-Jitter-Ms", strconv.Itoa(profile.CallFlushJitterMs))
+		}
+	}
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result.Welcome)))
 	w.WriteHeader(http.StatusOK)
@@ -360,6 +391,7 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	var body []byte
 	var next uint64
 	var laneClosed bool
+	var laneID uint32
 	switch value.CarrierMode() {
 	case config.CarrierHTTPS:
 		if r.Header.Get("X-Lane-ID") != "" {
@@ -373,9 +405,10 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 			s.serveNotFound(w, r)
 			return
 		}
+		laneID = uint32(lane)
 		body, next, laneClosed, err = value.PollLane(
 			r.Context(),
-			uint32(lane),
+			laneID,
 			cursor)
 	default:
 		s.serveNotFound(w, r)
@@ -403,10 +436,155 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if laneID != 0 && value.IsCallLane(laneID) {
+		if profile := value.Profile(); profile != nil && profile.CallFlushJitterMs > 0 {
+			if !sleepCallFlushJitter(r.Context(), profile.CallFlushJitterMs) {
+				return
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, token string) {
+	if r.Method != http.MethodPost ||
+		!binaryContentType(r.Header.Get("Content-Type")) ||
+		r.Header.Get("X-Lane-ID") != "" ||
+		r.Header.Get("X-Up-Seq") != "" ||
+		r.Header.Get("X-Down-Cursor") != "" {
+		if r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
+		s.serveNotFound(w, r)
+		return
+	}
+	value, err := s.manager.Get(token)
+	if err != nil || value.CarrierMode() != config.CarrierHTTPSStream {
+		if r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
+		s.serveNotFound(w, r)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		if r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
+		s.serveNotFound(w, r)
+		return
+	}
+	mine, err := value.AcquireStreamCarrier()
+	if err != nil {
+		if r.ContentLength != 0 {
+			s.setReadDeadline(w)
+		}
+		s.serveNotFound(w, r)
+		return
+	}
+	defer value.ReleaseStreamCarrier(mine)
+
+	controller := http.NewResponseController(w)
+	if controller != nil {
+		_ = controller.EnableFullDuplex()
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	upDone := make(chan struct{})
+	go func() {
+		defer close(upDone)
+		defer cancel()
+		for {
+			sequence, ackCursor, body, err := frame.ReadStreamUpEnvelope(
+				r.Body,
+				s.config.Limits.MaxBodyBytes,
+				func() {
+					if controller != nil && ctx.Err() == nil {
+						_ = controller.SetReadDeadline(time.Now().Add(s.config.Timeouts.Idle.Value()))
+					}
+				},
+				func() {
+					if controller != nil && ctx.Err() == nil {
+						_ = controller.SetReadDeadline(time.Now().Add(s.bodyReadDeadline))
+					}
+				},
+			)
+			if err != nil {
+				if errors.Is(err, frame.ErrPayload) {
+					value.Close()
+				}
+				return
+			}
+			if err := value.AckDownCursor(ackCursor); err != nil {
+				return
+			}
+			if sequence == 0 {
+				continue
+			}
+			deadline := time.NewTimer(30 * time.Second)
+			for {
+				ack, processErr := value.ProcessUp(sequence, body)
+				if processErr == nil && ack == sequence {
+					if !deadline.Stop() {
+						<-deadline.C
+					}
+					break
+				}
+				if !errors.Is(processErr, session.ErrBackpressure) &&
+					!errors.Is(processErr, session.ErrConcurrent) {
+					deadline.Stop()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					deadline.Stop()
+					return
+				case <-mine:
+					deadline.Stop()
+					return
+				case <-deadline.C:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+		}
+	}()
+
+	for {
+		body, cursor, err := value.NextStreamDownBatch(ctx, mine)
+		if err != nil || len(body) == 0 {
+			break
+		}
+		if value.HasActiveCallStreams() {
+			if profile := value.Profile(); profile != nil && profile.CallFlushJitterMs > 0 {
+				if !sleepCallFlushJitter(ctx, profile.CallFlushJitterMs) {
+					break
+				}
+			}
+		}
+		if controller != nil {
+			_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		}
+		envelope := frame.EncodeStreamDownEnvelope(cursor, body)
+		if _, err := w.Write(envelope); err != nil {
+			break
+		}
+		flusher.Flush()
+	}
+	cancel()
+	if controller != nil {
+		_ = controller.SetReadDeadline(time.Now())
+	}
+	<-upDone
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -594,16 +772,26 @@ func (s *Server) writeWebSocket(
 			finished <- nil
 			return
 		}
-		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			finished <- err
-			return
-		}
 		if len(body) == 0 {
+			if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				finished <- err
+				return
+			}
 			if err := connection.WriteMessage(websocket.PingMessage, nil); err != nil {
 				finished <- err
 				return
 			}
 			continue
+		}
+		if cursor != 0 && ((lanes && value.IsCallLane(laneID)) || (!lanes && value.HasActiveCallStreams())) {
+			if !sleepCallFlushJitter(ctx, value.Profile().CallFlushJitterMs) {
+				finished <- ctx.Err()
+				return
+			}
+		}
+		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			finished <- err
+			return
 		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
 			finished <- err
@@ -670,7 +858,7 @@ func (s *Server) transportSuffix(requestPath string) (string, bool) {
 		return "", false
 	}
 	switch suffix := requestPath[len(s.base):]; suffix {
-	case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws":
+	case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws", "api/v1/stream":
 		return suffix, true
 	}
 	return "", false
@@ -772,4 +960,26 @@ func canonicalUint(value string) (uint64, bool) {
 	}
 	result, err := strconv.ParseUint(value, 10, 64)
 	return result, err == nil && strconv.FormatUint(result, 10) == value
+}
+
+func sleepCallFlushJitter(ctx context.Context, maxJitterMs int) bool {
+	if maxJitterMs <= 0 {
+		return true
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return true
+	}
+	delayMs := int(b[0]) % (maxJitterMs + 1)
+	if delayMs == 0 {
+		return true
+	}
+	timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

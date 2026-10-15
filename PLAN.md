@@ -69,9 +69,11 @@ deployable server with several future products. This revision fixes the followin
    query value. WebView inputs contain that derived value rather than the MTProxy
    secret.
 3. Profiles can select the baseline serialized HTTPS carrier, stream-aware HTTPS
-   lanes, one multiplexed WebSocket, or one WebSocket per logical stream.
-   Streaming fetch, H3, Telegram Web integration, calls, and cross-process session
-   resume remain deferred.
+   lanes, one multiplexed WebSocket, or one WebSocket per logical stream;
+   deployments on DPI-filtered or TSPU paths should prefer `https-lanes` (or
+   `https`) to avoid HTTP `101` WebSocket upgrade fingerprinting. Streaming
+   fetch, H3, Telegram Web integration, calls, and cross-process session resume
+   remain deferred.
 4. Caddy terminates TLS and serves the public site. The Go process is an internal
    application server.
 5. The official MTProxy `-H` and `-p` arguments are ports, not bind addresses.
@@ -327,8 +329,8 @@ Bridge behavior:
 2. `POST /api/v1/session` with the bootstrap token and first buffer.
 3. Forward the returned `WELCOME` body to the client boundary.
 4. Run the profile-selected carrier: one serialized HTTPS pair, one independent
-   HTTPS pair per logical stream, one multiplexed WebSocket, or one WebSocket per
-   logical stream.
+   HTTPS pair per logical stream, one full-duplex HTTPS stream (`/api/v1/stream`),
+   one multiplexed WebSocket, or one WebSocket per logical stream.
 5. Retry ambiguous HTTP failures with the same sequence/cursor and byte-identical
    body, using bounded exponential backoff with jitter.
 6. Report `reconnecting` during transient carrier loss.
@@ -338,8 +340,11 @@ Bridge behavior:
    session-close request. Server idle cleanup remains the fallback.
 
 The reference modes and their exact authentication, sequencing, replay, and close
-semantics are specified normatively in `PROTOCOL.md`. The remainder of this section
-describes the original serialized HTTPS baseline.
+semantics are specified normatively in `PROTOCOL.md`. When deployed across
+stateful middleboxes that fingerprint and throttle RFC 6455 `101 Switching
+Protocols` upgrades after a few megabytes (such as TSPU), profiles should prefer
+`https-lanes`, `https-stream`, or `https` over `websocket` and `websocket-lanes`. The remainder
+of this section describes the original serialized HTTPS baseline.
 
 ## 6. Baseline HTTP carrier protocol
 
@@ -467,6 +472,8 @@ V1 shared-frame values:
 | `0x04` | `WINDOW` | both | >0 | nonzero big-endian `u32` delta |
 | `0x05` | `PING` | relay to client | 0 | opaque echo token |
 | `0x06` | `PONG` | client to relay | 0 | exact token |
+| `0x07` | `OPEN_TCP` | client to relay | >0 | `addr_len:u8 (4\|16) \| ip \| port:u16` (when `calls_tcp` enabled) |
+| `0x08` | `PAD` | both | 0 | `0..255` opaque padding bytes |
 | `0x10` | `HELLO` | client to relay | 0 | one byte `01` |
 | `0x11` | `WELCOME` | relay to client | 0 | empty |
 | `0x1f` | `BYE` | relay to client | 0 | optional bounded reason |
@@ -966,7 +973,8 @@ Hosted acceptance:
 - a separate production `/bridge` route or API access without session credentials;
 - running official MTProxy as a separate public service;
 - use of the raw MTProxy secret by bridge JavaScript;
-- WebSocket, streaming fetch, HTTP/3, WebTransport, or CDN fronting;
+- streaming fetch, HTTP/3, WebTransport, or CDN fronting (WebSocket carriers are
+  implemented; see `README.md` for carrier selection on DPI-filtered networks);
 - Telegram Web A/K integration;
 - calls or UDP relay;
 - client-selected backend destinations;

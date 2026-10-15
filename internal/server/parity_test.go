@@ -86,7 +86,7 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 			r.Header.Set("Content-Type", "application/octet-stream")
 		},
 	}
-	apiPaths := []string{"/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/ws", "/api/v1/nope"}
+	apiPaths := []string{"/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/ws", "/api/v1/stream", "/api/v1/nope"}
 	missPaths := []string{"/nonexistent", "/api/nope"}
 	rootQueries := []string{"", "?x=1", "?bridge=short", "?bridge=" + strings.Repeat("A", 43), "?bridge=" + strings.Repeat("A", 43) + "&x=1"}
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodOptions, http.MethodDelete} {

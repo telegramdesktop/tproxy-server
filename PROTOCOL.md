@@ -179,10 +179,22 @@ response headers.
 ## Carrier modes
 
 Each server profile selects one `carrier_mode`: `https`, `https-lanes`,
-`websocket`, or `websocket-lanes`. Omitting it preserves the original `https`
+`https-stream`, `websocket`, or `websocket-lanes`. Omitting it preserves the original `https`
 mode. The choice is embedded in the generated bridge page and fixed for the
 resulting relay session; clients do not need a new setting or protocol
 implementation.
+
+On the public TLS listener, `https`, `https-lanes`, and `https-stream` use ordinary HTTP request
+and response semantics (typically multiplexed over ALPN `h2` by Caddy) with no
+HTTP/1.1 `Upgrade: websocket` / `101 Switching Protocols` transition. By
+contrast, `websocket` and `websocket-lanes` perform an RFC 6455 upgrade and
+maintain long-lived bidirectional WebSocket connections, which stateful DPI
+middleboxes (including TSPU) can classify and throttle after roughly 2 MiB of
+transfer. Deployments serving clients on such paths should select `https-lanes`,
+`https-stream`, or `https`. Because middleboxes treat `HTTP/1.1 101` differently
+from standard `POST`/`GET` requests, `carrier_mode` is strictly a server-profile
+property and clients must never self-negotiate or override the profile's
+configured mode.
 
 Carrier requests normally have `Origin: https://H`, but the reference relay does
 not authenticate that header: native WebViews may omit it, while non-browser
@@ -209,7 +221,7 @@ Body: one HELLO frame
 200 OK
 X-Session-Token: session-token
 X-Down-Cursor: 0
-X-Carrier-Mode: https | https-lanes | websocket | websocket-lanes
+X-Carrier-Mode: https | https-lanes | https-stream | websocket | websocket-lanes
 Body: one WELCOME frame
 ```
 
@@ -328,6 +340,45 @@ head-of-line blocking between logical sessions. It assumes normal HTTP/2 service
 the public origin; HTTP/1.1 per-origin connection limits can constrain a large set
 of simultaneous long polls.
 
+### Full-duplex HTTPS stream
+
+`https-stream` replaces stop-and-wait HTTP request batches with a single long-lived
+full-duplex `POST /api/v1/stream`:
+
+```text
+POST /api/v1/stream
+Authorization: Bearer session-token
+Content-Type: application/octet-stream
+```
+
+The request body is a continuous stream of 20-byte big-endian uplink envelopes:
+
+```text
+sequence:u64 | ack_cursor:u64 | length:u32 | frames[length]
+```
+
+- When `sequence > 0`, `frames` is a complete frame batch (`1..max_body_bytes` bytes)
+  processed with the same monotonic deduplication as `/api/v1/up`.
+- When `sequence == 0`, `length` must be `0`; the envelope is an ack-only cursor
+  update that advances `ack_cursor` without carrying frames.
+
+The `200 OK` response body is a continuous stream of 12-byte big-endian downlink
+envelopes flushed immediately after each batch (`flush_interval -1` in Caddy):
+
+```text
+cursor:u64 | length:u32 | frames[length]
+```
+
+If a stream disconnects before the client acknowledges `cursor` via `ack_cursor`,
+a reconnecting `POST /api/v1/stream` supersedes the previous carrier attachment and
+re-emits the unacknowledged downlink batch byte-for-byte before advancing to new
+frames. Instead of a fixed 30-second one-shot body read deadline, `/api/v1/stream`
+extends the read deadline by `timeouts.idle` before each 20-byte envelope header and
+bounds each envelope body read to 30 seconds. In WebViews, streaming request bodies
+use `fetch(..., { duplex: 'half', body: ReadableStream })` (supported on Chromium
+desktop and Android System WebView; not supported on iOS `WKWebView`, where profiles
+should use `https-lanes` or a native HTTP/2 sidecar).
+
 ### Multiplexed WebSocket
 
 `websocket` mode performs the same HTTPS session creation, then opens:
@@ -418,6 +469,8 @@ type:u8 | stream_id:u24 | payload_length:u32 | payload
 | `0x04` | `WINDOW` | both | nonzero | nonzero `u32` delta |
 | `0x05` | `PING` | relay → client | zero | opaque echo token |
 | `0x06` | `PONG` | client → relay | zero | exact echo token |
+| `0x07` | `OPEN_TCP` | client → relay | nonzero | `addr_len:u8 (4\|16) \| ip \| port:u16` |
+| `0x08` | `PAD` | both | zero | `0..255` opaque padding bytes |
 | `0x10` | `HELLO` | client → relay | zero | byte `01` |
 | `0x11` | `WELCOME` | relay → client | zero | empty |
 | `0x1f` | `BYE` | relay → client | zero | optional bounded reason |
@@ -476,6 +529,43 @@ well-formed late DATA, WINDOW, or CLOSE frames from a close race can be ignored.
 If an otherwise valid `OPEN` exceeds a per-session, profile, process-wide,
 dial-in-flight, or stream-creation-rate limit, the relay returns `CLOSE` for that
 stream id. It does not close the authenticated session or its other streams.
+
+### Opt-in TCP reflector streams for calls (`OPEN_TCP`)
+
+When a profile sets `"calls_tcp": true` on `https-lanes`, `websocket-lanes`, or
+`https-stream`, `POST /api/v1/session` includes `X-Call-TCP: 1` in its `200 OK`
+response and permits a nonzero stream or lane to open with `OPEN_TCP` (`0x07`)
+instead of `OPEN` (`0x01`). Its payload is a 7-byte IPv4 (`0x04 | ip[4] | port:u16`)
+or 19-byte IPv6 (`0x10 | ip[16] | port:u16`) numeric endpoint with a nonzero port;
+DNS names are never accepted.
+
+Before checking the profile's `call_allowlist` CIDRs and `call_ports`, the relay
+calls `Addr.Unmap()` and unconditionally rejects unspecified, loopback, private
+RFC 1918 / RFC 4193, link-local, and multicast destinations, preventing SSRF to
+loopback services (`127.0.0.1:2398`, `127.0.0.1:8080`, `127.0.0.1:8081`) or
+private networks even if an operator misconfigures `call_allowlist`. A target that
+is not permitted by `call_allowlist` and `call_ports` (or that fails to dial)
+receives `CLOSE` on that stream id without terminating the parent relay session.
+Receiving `OPEN_TCP` when `calls_tcp` is false or on `https`/`websocket` is a
+protocol error.
+
+On mobile clients where the WebView is foreground-scoped (`ANDROID.md`, `IOS.md`),
+a native VoIP call sidecar can fetch `GET /?bridge=<capability>` directly over
+HTTPS to obtain its own independent `bootstrap` token and `POST /api/v1/session`
+bearer (`X-Session-Token`). This Dual-Session Native Call Sidecar pattern keeps
+`X-Up-Seq`, `X-Down-Cursor`, and `stream_id` namespaces isolated from the
+foreground WebView so active calls survive proximity-sensor screen-off and app
+backgrounding.
+
+When call padding is enabled (`call_pad_buckets`, default `[256, 384, 512, 768]`,
+and `call_flush_jitter_ms`, default `8`), `POST /api/v1/session` also returns
+`X-Call-Pad-Buckets` and `X-Call-Flush-Jitter-Ms`. Both the bridge and the relay
+pad carrier writes for active call lanes/streams to a randomized bucket boundary
+by appending one or more `PAD` (`0x08`, `stream_id = 0`, payload `0..255` bytes)
+frames and applying a bounded `0..call_flush_jitter_ms` flush delay. If a remainder
+is `1..7` bytes (`< HeaderSize`), the target steps up by `128` bytes so a valid
+8-byte-header `PAD` frame always fits without overflow. Receiving sides strip
+`PAD` frames before lane-ID checks, window accounting, and native client delivery.
 
 ## Implementation references
 

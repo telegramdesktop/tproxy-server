@@ -784,6 +784,287 @@ func TestAdminSurfaceIsSeparate(t *testing.T) {
 	}
 }
 
+func TestCallsTCPHeaderAndDualSessionSidecar(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+		value.Profiles[0].CallsTCP = true
+		value.Profiles[0].CallPadBuckets = config.DefaultCallPadBuckets()
+		value.Profiles[0].CallFlushJitterMs = config.DefaultCallFlushJitterMs
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
+	capability := config.CapabilityString(config.DeriveCapability(testHost, "", secret))
+	match := regexp.MustCompile(`bootstrap="([A-Za-z0-9_-]{43})"`)
+
+	issueSession := func() string {
+		bridgeResponse := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+url.QueryEscape(capability), nil, ""))
+		bridgeBody := readResponse(t, bridgeResponse)
+		found := match.FindSubmatch(bridgeBody)
+		if len(found) != 2 {
+			t.Fatal("could not locate embedded bootstrap token")
+		}
+		bootstrap := string(found[1])
+		created := perform(t, hosted.Client(), apiRequest(
+			t,
+			http.MethodPost,
+			hosted.URL+"/api/v1/session",
+			bootstrap,
+			frame.Encode(frame.Hello, 0, []byte{1})))
+		_ = readResponse(t, created)
+		if created.StatusCode != http.StatusOK {
+			t.Fatalf("session creation failed: status %d", created.StatusCode)
+		}
+		if created.Header.Get("X-Call-TCP") != "1" {
+			t.Fatalf("expected X-Call-TCP: 1 header, got %q", created.Header.Get("X-Call-TCP"))
+		}
+		if created.Header.Get("X-Call-Pad-Buckets") != "256,384,512,768" {
+			t.Fatalf("expected X-Call-Pad-Buckets: 256,384,512,768, got %q", created.Header.Get("X-Call-Pad-Buckets"))
+		}
+		if created.Header.Get("X-Call-Flush-Jitter-Ms") != "8" {
+			t.Fatalf("expected X-Call-Flush-Jitter-Ms: 8, got %q", created.Header.Get("X-Call-Flush-Jitter-Ms"))
+		}
+		return created.Header.Get("X-Session-Token")
+	}
+
+	webViewToken := issueSession()
+	callSidecarToken := issueSession()
+	if webViewToken == "" || callSidecarToken == "" || webViewToken == callSidecarToken {
+		t.Fatalf("expected two independent session tokens for dual-session sidecar, got %q and %q", webViewToken, callSidecarToken)
+	}
+}
+
+func issueHTTPSStreamSession(t *testing.T, client *http.Client, baseURL string) string {
+	t.Helper()
+	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
+	capability := config.CapabilityString(config.DeriveCapability(testHost, "", secret))
+	match := regexp.MustCompile(`bootstrap="([A-Za-z0-9_-]{43})"`)
+
+	bridgeResponse := perform(t, client, request(t, http.MethodGet, baseURL+"/?bridge="+url.QueryEscape(capability), nil, ""))
+	bridgeBody := readResponse(t, bridgeResponse)
+	found := match.FindSubmatch(bridgeBody)
+	if len(found) != 2 {
+		t.Fatal("could not locate embedded bootstrap token")
+	}
+	bootstrap := string(found[1])
+	created := perform(t, client, apiRequest(
+		t,
+		http.MethodPost,
+		baseURL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	if created.StatusCode != http.StatusOK {
+		t.Fatalf("session creation failed: status %d", created.StatusCode)
+	}
+	if created.Header.Get("X-Carrier-Mode") != string(config.CarrierHTTPSStream) {
+		t.Fatalf("expected X-Carrier-Mode %q, got %q", config.CarrierHTTPSStream, created.Header.Get("X-Carrier-Mode"))
+	}
+	return created.Header.Get("X-Session-Token")
+}
+
+func openStreamRequest(t *testing.T, client *http.Client, baseURL, token string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/stream", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = testHost
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	req.Header.Set("Origin", "https://"+testHost)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func readStreamForData(
+	t *testing.T,
+	r io.Reader,
+	pw io.Writer,
+	streamID uint32,
+	want []byte,
+) uint64 {
+	t.Helper()
+	var received []byte
+	var lastCursor uint64
+	for attempt := 0; attempt < 8; attempt++ {
+		cursor, down, err := frame.ReadStreamDownEnvelope(r, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastCursor = cursor
+		frames, err := frame.ParseAll(down, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == streamID {
+				received = append(received, f.Payload...)
+			}
+		}
+		if bytes.Equal(received, want) {
+			return lastCursor
+		}
+		if _, err := pw.Write(frame.EncodeStreamUpEnvelope(0, lastCursor, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatalf("expected stream %d data %q, got %q", streamID, want, received)
+	return 0
+}
+
+func TestHTTPSStreamFullDuplexEcho(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSStream
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewUnstartedServer(application.Handler())
+	hosted.EnableHTTP2 = true
+	hosted.StartTLS()
+	defer hosted.Close()
+
+	token := issueHTTPSStreamSession(t, hosted.Client(), hosted.URL)
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	resp := openStreamRequest(t, hosted.Client(), hosted.URL, token, pr)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
+	}
+
+	firstUp := append(
+		frame.Encode(frame.Open, 1, nil),
+		frame.Encode(frame.Data, 1, []byte("alpha"))...,
+	)
+	if _, err := pw.Write(frame.EncodeStreamUpEnvelope(1, 0, firstUp)); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor1 := readStreamForData(t, resp.Body, pw, 1, []byte("alpha"))
+
+	secondUp := frame.Encode(frame.Data, 1, []byte("bravo"))
+	if _, err := pw.Write(frame.EncodeStreamUpEnvelope(2, cursor1, secondUp)); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor2 := readStreamForData(t, resp.Body, pw, 1, []byte("bravo"))
+
+	if _, err := pw.Write(frame.EncodeStreamUpEnvelope(0, cursor2, nil)); err != nil {
+		t.Fatal(err)
+	}
+	_ = pw.Close()
+}
+
+func TestHTTPSStreamSurvivesPastBodyReadDeadline(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSStream
+	})
+	application.bodyReadDeadline = 40 * time.Millisecond
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	token := issueHTTPSStreamSession(t, hosted.Client(), hosted.URL)
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	resp := openStreamRequest(t, hosted.Client(), hosted.URL, token, pr)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
+	}
+
+	// Wait longer than the one-shot bodyReadDeadline (40ms) before sending the first envelope.
+	time.Sleep(70 * time.Millisecond)
+
+	firstUp := append(
+		frame.Encode(frame.Open, 1, nil),
+		frame.Encode(frame.Data, 1, []byte("pulse-1"))...,
+	)
+	if _, err := pw.Write(frame.EncodeStreamUpEnvelope(1, 0, firstUp)); err != nil {
+		t.Fatalf("stream died after bodyReadDeadline: %v", err)
+	}
+	cursor1, _, err := frame.ReadStreamDownEnvelope(resp.Body, frame.MaxPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait again past bodyReadDeadline between envelopes.
+	time.Sleep(70 * time.Millisecond)
+
+	secondUp := frame.Encode(frame.Data, 1, []byte("pulse-2"))
+	if _, err := pw.Write(frame.EncodeStreamUpEnvelope(2, cursor1, secondUp)); err != nil {
+		t.Fatalf("stream died between envelopes after bodyReadDeadline: %v", err)
+	}
+	cursor2, down2, err := frame.ReadStreamDownEnvelope(resp.Body, frame.MaxPayload)
+	if err != nil || cursor2 != 2 || len(down2) == 0 {
+		t.Fatalf("expected second envelope after bodyReadDeadline, cursor=%d err=%v", cursor2, err)
+	}
+	_ = pw.Close()
+}
+
+func TestHTTPSStreamReconnectReplaysUnackedDownlink(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSStream
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	token := issueHTTPSStreamSession(t, hosted.Client(), hosted.URL)
+
+	pr1, pw1 := io.Pipe()
+	resp1 := openStreamRequest(t, hosted.Client(), hosted.URL, token, pr1)
+	firstUp := append(
+		frame.Encode(frame.Open, 1, nil),
+		frame.Encode(frame.Data, 1, []byte("replay-me"))...,
+	)
+	if _, err := pw1.Write(frame.EncodeStreamUpEnvelope(1, 0, firstUp)); err != nil {
+		t.Fatal(err)
+	}
+	cursor1, down1, err := frame.ReadStreamDownEnvelope(resp1.Body, frame.MaxPayload)
+	if err != nil || cursor1 != 1 {
+		t.Fatalf("expected first downlink cursor=1, got cursor=%d err=%v", cursor1, err)
+	}
+	// Disconnect first stream before acknowledging cursor=1.
+	_ = pw1.Close()
+	_ = resp1.Body.Close()
+
+	// Reconnect on a second POST /api/v1/stream and verify cursor=1 is replayed byte-for-byte.
+	pr2, pw2 := io.Pipe()
+	defer pw2.Close()
+	resp2 := openStreamRequest(t, hosted.Client(), hosted.URL, token, pr2)
+	defer resp2.Body.Close()
+
+	replayedCursor, replayedDown, err := frame.ReadStreamDownEnvelope(resp2.Body, frame.MaxPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayedCursor != cursor1 || !bytes.Equal(replayedDown, down1) {
+		t.Fatalf("expected replayed cursor=%d matching original bytes, got cursor=%d", cursor1, replayedCursor)
+	}
+	if _, err := pw2.Write(frame.EncodeStreamUpEnvelope(0, replayedCursor, nil)); err != nil {
+		t.Fatal(err)
+	}
+	_ = pw2.Close()
+}
+
 func newTestServer(t *testing.T, backend string) (*Server, []byte) {
 	return newConfiguredTestServer(t, backend, nil)
 }

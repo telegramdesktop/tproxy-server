@@ -12,7 +12,8 @@ The design is not tied to one Telegram client or operating system. Any Telegram
 app that can host a WebView and connect its MTProxy sockets to a small local adapter
 can implement the client side. The current proof-of-concept work includes a
 Telegram Desktop implementation, an experimental Android client described in
-[`ANDROID.md`](ANDROID.md), and an iOS client plan in [`IOS.md`](IOS.md). All use
+[`ANDROID.md`](ANDROIDsaleh
+.md), and an iOS client plan in [`IOS.md`](IOS.md). All use
 the same bridge page, carrier selection, shared frame format, and server deployment.
 
 The configured hostname remains a regular HTTPS website. A capability derived from
